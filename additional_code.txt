@@ -1,0 +1,58 @@
+def diversified_by_geo_with_fallback(
+    client,
+    collection_name,
+    query_vec,
+    countries=None,
+    regions=None,
+    *,
+    final_k=10,
+    pool_mult=2,
+    pool_target=20,  # how many total you want to gather before trimming
+    **kwargs
+):
+    # Step 1: normal diversified search
+    shortlist = diversified_by_geo(
+        client=client,
+        collection_name=collection_name,
+        query_vec=query_vec,
+        countries=countries,
+        regions=regions,
+        final_k=final_k,
+        pool_mult=pool_mult,
+        **kwargs
+    )
+
+    # Step 2: if not enough candidates, relax geo filters
+    if len(shortlist) < pool_target:
+        fill = client.search(
+            collection_name=collection_name,
+            query_vector=query_vec,
+            limit=pool_target * 2,  # fetch extra for safety
+            with_payload=True,
+            with_vectors=False,
+        )
+        seen = {h.id for h in shortlist}
+        for h in fill:
+            if h.id not in seen:
+                shortlist.append(h)
+                seen.add(h.id)
+            if len(shortlist) >= pool_target:
+                break
+
+    # Step 3: global re-rank and trim
+    shortlist.sort(key=lambda h: h.score, reverse=True)
+    return shortlist[:final_k]
+
+results = diversified_by_geo_with_fallback(
+    client,
+    collection_name="my_docs_bge",
+    query_vec=query_vec,
+    countries=["Singapore","Malaysia"],
+    regions=["Asia"],
+    final_k=10,
+    pool_target=20,
+    per_country_max=5
+)
+
+for r in results:
+    print(r.id, r.score, r.payload.get("country"), r.payload.get("region"))
