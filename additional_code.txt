@@ -1,4 +1,66 @@
-    @torch.inference_mode()
+from typing import List, Dict, Any
+
+def to_context_items(reranked: List[Dict[str, Any]], max_chars: int = 1200) -> List[Dict[str, Any]]:
+    """
+    Normalize reranked Qdrant results into a minimal schema for LLM context.
+    Expected format per item:
+      {
+        "id": 1234,
+        "text": "...",
+        "payload": {
+            "region": "asia",
+            "country": "korea",
+            "filename": "client a rfp",
+            "updated_date": "2024-12-31",
+            "topic": "virtual account",  # ignored
+        }
+      }
+    """
+    items = []
+    for i, d in enumerate(reranked, start=1):
+        payload = d.get("payload", {}) or {}
+        text = d.get("text", "").strip()
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip() + "…"
+        items.append({
+            "id": f"S{i}",
+            "text": text,
+            "region": payload.get("region", ""),
+            "country": payload.get("country", ""),
+            "filename": payload.get("filename", ""),
+            "updated_date": payload.get("updated_date", ""),
+        })
+    return items
+
+def render_context_pack(items: List[Dict[str, Any]]) -> str:
+    """
+    Render context into a compact LLM-friendly format.
+    """
+    lines = ["[CONTEXT]"]
+    for it in items:
+        # Build metadata string
+        meta_bits = []
+        if it["region"]: meta_bits.append(f"region={it['region']}")
+        if it["country"]: meta_bits.append(f"country={it['country']}")
+        if it["filename"]: meta_bits.append(f"file={it['filename']}")
+        if it["updated_date"]: meta_bits.append(f"updated={it['updated_date']}")
+        meta = "; ".join(meta_bits)
+
+        header = f"--- {it['id']} ({meta})"
+        body = it["text"]
+
+        lines.append(header)
+        lines.append(body)
+        lines.append("")  # blank line
+    lines.append("[/CONTEXT]")
+    return "\n".join(lines)
+
+
+
+
+
+   
+@torch.inference_mode()
     def rerank(
         self,
         query: str,
