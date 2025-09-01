@@ -43,6 +43,134 @@ def diversified_by_geo_with_fallback(
     shortlist.sort(key=lambda h: h.score, reverse=True)
     return shortlist[:final_k]
 
+
+from math import ceil
+from qdrant_client import models
+
+def diversified_by_geo(
+    client,
+    collection_name: str,
+    query_vec,
+    countries: list[str] | None = None,
+    regions: list[str] | None = None,
+    *,
+    final_k: int = 10,              # hard limit for your model
+    pool_mult: int = 2,             # over-fetch for better selection (e.g., reranker)
+    single_country_pool: int = 20,  # when only 1 country ultimately matches
+    per_country_min: int = 1,
+    per_country_max: int = 6,
+    respect_user_country_order: bool = True,
+    # Optional: if you can expand regions to countries locally, pass a mapping:
+    region_to_countries: dict[str, list[str]] | None = None,
+    additional_must: list[models.Condition] | None = None,  # e.g., product/status constraints
+):
+    """
+    Returns up to `final_k` items diversified by country.
+    Supports country and/or region filters. If both provided, union them.
+    """
+    countries = [c.strip() for c in (countries or []) if c and str(c).strip()]
+    regions   = [r.strip() for r in (regions or []) if r and str(r).strip()]
+
+    # If you know how to expand regions locally, do it to get better adaptive caps:
+    expanded_countries = set(countries)
+    if region_to_countries and regions:
+        for r in regions:
+            expanded_countries.update(region_to_countries.get(r, []))
+
+    # Build the filter:
+    # (country IN countries) OR (region IN regions)
+    shoulds = []
+    if countries:
+        shoulds.append(models.FieldCondition(
+            key="country", match=models.MatchAny(any=countries)
+        ))
+    if regions:
+        shoulds.append(models.FieldCondition(
+            key="region", match=models.MatchAny(any=regions)
+        ))
+
+    # If nothing specified, we don't constrain by geo (caller should decide if that's allowed)
+    if not shoulds:
+        base_filter = models.Filter(must=(additional_must or None))
+    else:
+        base_filter = models.Filter(
+            must=(additional_must or None),
+            should=shoulds,
+        )
+
+    # Candidate pool size and adaptive per-country cap
+    pool_k = max(final_k * pool_mult, final_k)
+
+    # Decide how many countries are *expected*.
+    # If we could expand regions, use that; else we’ll let Qdrant figure it out.
+    if expanded_countries:
+        n_countries = len(expanded_countries)
+    else:
+        # We don't know the exact # countries that will match;
+        # assume at least 1; group_size will be corrected by round-robin later.
+        n_countries = max(1, len(countries) or len(regions) or 1)
+
+    if n_countries == 1:
+        group_size = min(single_country_pool, per_country_max or single_country_pool)
+    else:
+        target_per_country = ceil(pool_k / n_countries)
+        group_size = max(per_country_min, min(per_country_max, target_per_country))
+
+    # Use grouped search so each country contributes up to `group_size`
+    res = client.search_groups(
+        collection_name=collection_name,
+        query_vector=query_vec,
+        query_filter=base_filter,
+        group_by="country",
+        group_size=group_size,
+        limit=1024,                 # upper bound on #groups; Qdrant returns only those with hits
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    # Bucket per country
+    buckets = {g.group_id: list(g.hits) for g in res.groups}
+
+    # Determine round-robin order:
+    # 1) explicit countries first (in user order) if present,
+    # 2) then any other countries that matched via regions (stable order)
+    if respect_user_country_order and countries:
+        ordered = [c for c in countries if c in buckets] + [c for c in buckets.keys() if c not in countries]
+    else:
+        ordered = list(buckets.keys())
+
+    # Build diversified shortlist (round-robin) up to pool_k
+    shortlist = []
+    while len(shortlist) < pool_k and any(buckets[c] for c in ordered):
+        for c in ordered:
+            if buckets.get(c):
+                shortlist.append(buckets[c].pop(0))
+                if len(shortlist) >= pool_k:
+                    break
+
+    # Fallback: if underfilled, do one ungrouped fill from the same filter
+    if len(shortlist) < pool_k:
+        fill = client.search(
+            collection_name=collection_name,
+            query_vector=query_vec,
+            query_filter=base_filter,
+            limit=pool_k * 2,
+            with_payload=True,
+            with_vectors=False,
+        )
+        seen = {h.id for h in shortlist}
+        for h in fill:
+            if h.id not in seen:
+                shortlist.append(h)
+                seen.add(h.id)
+            if len(shortlist) >= pool_k:
+                break
+
+    # Global sort by score then trim to final_k (ready for reranker/LLM)
+    shortlist.sort(key=lambda h: h.score, reverse=True)
+    return shortlist[:final_k]
+
+
 results = diversified_by_geo_with_fallback(
     client,
     collection_name="my_docs_bge",
