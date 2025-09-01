@@ -1,3 +1,73 @@
+    @torch.inference_mode()
+    def rerank(
+        self,
+        query: str,
+        candidates: List[Candidate],
+        top_k: int = 10,
+        batch_size: int = 32,
+        text_key: str = "text",
+    ) -> List[Dict[str, Any]]:
+        """
+        Returns a list of candidates (dicts) sorted by cross-encoder score desc.
+        Adds:
+          - 'rerank_score': float
+          - preserves any original fields (e.g., Qdrant id, payload, vec score)
+        If input items are strings, they are returned as dicts with 'text'.
+        """
+        if not candidates:
+            return []
+
+        # Normalize candidates -> list of dicts with a 'text' field
+        norm: List[Dict[str, Any]] = []
+        for i, c in enumerate(candidates):
+            if isinstance(c, str):
+                norm.append({"idx": i, "text": c})
+            elif isinstance(c, dict):
+                if text_key not in c:
+                    raise KeyError(f"Candidate dict at index {i} missing '{text_key}'")
+                item = dict(c)  # shallow copy
+                item.setdefault("idx", i)
+                norm.append(item)
+            else:
+                raise TypeError(f"Unsupported candidate type at index {i}: {type(c)}")
+
+        # Build (query, passage) pairs for scoring
+        pairs = [(query, item[text_key]) for item in norm]
+
+        # Batched scoring
+        scores: List[float] = []
+        for i in range(0, len(pairs), batch_size):
+            batch_pairs = pairs[i : i + batch_size]
+            batch_scores = self.model.predict(batch_pairs, convert_to_numpy=True)
+            scores.extend(batch_scores.tolist())
+
+        # Attach scores and sort
+        for item, s in zip(norm, scores):
+            item["rerank_score"] = float(s)
+
+        norm.sort(key=lambda d: d["rerank_score"], reverse=True)
+        return norm[: min(top_k, len(norm))]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 from math import ceil
 from qdrant_client import models
 
