@@ -1,3 +1,101 @@
+import streamlit as st
+from docx import Document
+from docx.enum.text import WD_BREAK
+import io
+
+def insert_text_at_specific_location(template_path, text_to_insert, output_filename="modified_document.docx"):
+    """
+    More precise method to insert text after existing content.
+    """
+    try:
+        doc = Document(template_path)
+        
+        # Count existing paragraphs to understand document structure
+        existing_paragraphs = len(doc.paragraphs)
+        
+        # Add page break to ensure we're starting fresh on page 3
+        if existing_paragraphs > 0:
+            # Add page break after existing content
+            last_paragraph = doc.paragraphs[-1]
+            run = last_paragraph.runs[-1] if last_paragraph.runs else last_paragraph.add_run()
+            run.add_break(WD_BREAK.PAGE)
+        
+        # Add your content
+        new_paragraph = doc.add_paragraph(text_to_insert)
+        
+        # Save to BytesIO
+        doc_buffer = io.BytesIO()
+        doc.save(doc_buffer)
+        doc_buffer.seek(0)
+        
+        return doc_buffer.getvalue()
+    
+    except Exception as e:
+        st.error(f"Error: {str(e)}")
+        return None
+
+
+# Streamlit interface
+def streamlit_interface():
+    st.title("Word Document Editor")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        uploaded_file = st.file_uploader("Upload Word Template", type=['docx'])
+    
+    with col2:
+        if uploaded_file:
+            st.success("Template uploaded successfully!")
+    
+    text_content = st.text_area(
+        "Enter your text content:",
+        height=200,
+        help="This text will be inserted into page 3 of your document"
+    )
+    
+    if uploaded_file and text_content and st.button("Process Document"):
+        # Create temporary file
+        temp_file = "temp_doc.docx"
+        with open(temp_file, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        
+        # Process document
+        result = insert_text_at_specific_location(temp_file, text_content)
+        
+        if result:
+            st.download_button(
+                "Download Modified Document",
+                data=result,
+                file_name="updated_document.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+        
+        # Cleanup
+        import os
+        try:
+            os.remove(temp_file)
+        except:
+            pass
+
+
+
+##############################################
+Begin with a strong opening that acknowledges the client’s objectives and sets the tone for partnership.
+
+Clearly articulate the client’s objectives — what they are looking for and why it matters.
+
+Provide a solution overview that directly links to those objectives, showing how our solution addresses their problems/challenges.
+
+Highlight differentiators, technical expertise, innovation, and track record of success (drawn from answers/context).
+
+Emphasize measurable benefits and outcomes (e.g., cost savings, efficiency, compliance, scalability).
+
+End with a confident closing statement that reinforces reliability, partnership, and long-term value.
+
+
+
+
 from typing import List, Dict, Any
 
 def to_context_items(reranked: List[Dict[str, Any]], max_chars: int = 1200) -> List[Dict[str, Any]]:
