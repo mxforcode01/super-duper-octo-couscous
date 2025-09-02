@@ -1,0 +1,128 @@
+Great catch. You can make derailments a non-issue with a two-layer defense:
+
+Backend intent gate (cheap & fast) — detect if the user’s chat instruction is about the current RFP question (rephrase/expand) vs off-topic.
+
+In-prompt guardrails — even if something slips through, the LLM must refuse to change the answer and surface a clear “off-topic” notice.
+
+Below is everything you need.
+
+1) System message (with derailment guardrails)
+
+Use this for the Chat with AI side panel:
+
+You are an expert RFP proposal writer and research assistant.
+Your job is to revise or expand the answer for the CURRENT RFP QUESTION ONLY.
+
+Intent rules
+
+If the user instruction is rephrasing-only (e.g., “shorter,” “more persuasive,” “formal tone”): ignore context; rephrase the current draft.
+
+If the user instruction requests more information (e.g., “add regulatory details,” “include global coverage”): use the retrieved context provided.
+
+If the user instruction is off-topic (not about the current RFP question or its draft), do not answer the off-topic query and do not change the draft. Instead, return an Off-Topic Notice as specified below.
+
+Output format (must include these sections every time):
+
+### Revised Answer
+<the new/unchanged draft here>
+
+### What Changed
+- <bullets describing edits or “No changes made (instruction unrelated).”>
+
+### Notice (Only if off-topic)
+<one sentence: why it’s off-topic + offer: “Switch context or start a new chat?”>
+
+
+Do not invent facts. Never answer questions unrelated to the current RFP question in this panel.
+
+2) Prompt message
+
+Question:
+
+{{question_text}}
+
+
+Current Draft Answer:
+
+{{current_answer}}
+
+
+User Instruction:
+
+{{user_instruction}}
+
+
+Retrieved Context (optional; may be empty):
+
+{{retrieved_context}}
+
+
+Follow the System Message. Produce the three sections exactly as specified.
+
+3) Lightweight backend intent gate (so you don’t even send context when not needed)
+
+Use a tiny rule-based classifier before you call the LLM. It’s fast and avoids sending retrieval context for rephrase-only edits.
+
+import re
+
+REPHRASE_HINTS = r"(rephrase|rewrite|polish|tone|shorter|concise|clearer|simplify|formal|persuasive|impactful|tighten|grammar|flow)"
+EXPAND_HINTS   = r"(add|expand|include|more detail|evidence|examples|data|metrics|cite|reference|source|regulator|coverage|capability)"
+OFFTOPIC_CLUES = r"(weather|movie|stock price|personal advice|unrelated|not about this question)"
+
+def classify_intent(user_instruction: str, question_text: str) -> str:
+    ui = user_instruction.lower()
+
+    # basic off-topic screen: if it references nothing about the question keywords and looks generic
+    q_keywords = set(re.findall(r"[a-zA-Z]{4,}", question_text.lower()))
+    overlap = sum(1 for w in re.findall(r"[a-zA-Z]{4,}", ui) if w in q_keywords)
+
+    if re.search(OFFTOPIC_CLUES, ui) or overlap == 0 and not re.search(EXPAND_HINTS, ui) and not re.search(REPHRASE_HINTS, ui):
+        return "off_topic"
+
+    if re.search(REPHRASE_HINTS, ui) and not re.search(EXPAND_HINTS, ui):
+        return "rephrase"
+
+    if re.search(EXPAND_HINTS, ui):
+        return "expand"
+
+    # default to rephrase (safer/cheaper)
+    return "rephrase"
+
+
+Routing logic:
+
+rephrase → Call LLM without retrieved context (save tokens).
+
+expand → Run RAG, pass retrieved_context to the prompt.
+
+off_topic → Option A: don’t call LLM; immediately return a canned response in your required format:
+
+### Revised Answer
+{{current_answer}}  # unchanged
+
+### What Changed
+- No changes made (instruction unrelated to this question).
+
+### Notice (Only if off-topic)
+Your request seems unrelated to this RFP question. Switch context or start a new chat?
+
+
+Option B: still call LLM (it will output the same shape due to system guardrails).
+
+4) UX tips to prevent confusion
+
+Show the current question title pinned at the top of the chat panel (“Editing: Q12 – Data Security & Compliance”).
+
+If off_topic, render two quick actions: [Switch Question] and [Start New Chat].
+
+When intent = rephrase, label the panel “Rephrase mode”; when intent = expand, label “Research mode”.
+
+5) Testing checklist
+
+Rephrase-only prompts (“shorter”, “more persuasive”) → no context sent; LLM ignores any residual retrieved_context.
+
+Expand prompts (“add MAS compliance details”) → context sent; “What Changed” lists added facts with brief provenance if you wish (“added MAS TRM mention”).
+
+Off-topic (“What’s the weather”) → draft unchanged + Off-Topic Notice.
+
+This combo (backend intent gate + strict system rules + fixed output sections) keeps the model from mixing the user’s side-chat with the actual RFP question, while giving users a smooth way to redirect if they truly meant to change context.
