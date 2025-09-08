@@ -1,3 +1,97 @@
+POSITIVE_REPHRASE_PROTOTYPES = [
+    # Pure rephrase
+    "rephrase the previous answer",
+    "rewrite this response",
+    "rewrite this to be more concise",
+    "polish this",
+    "polish this response",
+    "clean this up",
+    "clean up the wording",
+    "refine the wording",
+    "make this client-ready",
+    "improve clarity without adding facts",
+    "improve clarity without adding new info",
+    "keep the facts the same, just rewrite",
+    "preserve facts, rewrite only",
+    "no new claims — just refine",
+
+    # Shorter / tighter
+    "make it shorter",
+    "more concise, please",
+    "shorten this to 120 words",
+    "tighten this to ~120 words",
+    "trim the fluff; keep the numbers",
+    "give me a punchier version",
+    "compress into a brief paragraph",
+
+    # Longer (same facts)
+    "expand this slightly (same facts)",
+    "flesh it out to ~200 words",
+    "add transitions and make it flow (no new claims)",
+    "elaborate a bit for a non-expert audience",
+
+    # Tone & style
+    "make it more professional",
+    "more professional tone",
+    "less formal, more conversational",
+    "sharpen the executive tone",
+    "make it persuasive but factual",
+    "neutral, objective tone for compliance",
+    "make it sound like our bank's style guide",
+
+    # Structure / formatting
+    "turn this into bullet points",
+    "convert to an executive summary",
+    "executive summary version",
+    "restructure into: challenge -> solution -> benefits",
+    "put key points first, then details",
+    "headline and three bullets",
+    "make it slide-ready",
+
+    # Audience-specific
+    "rewrite for a CFO audience",
+    "make it client-facing (no internal jargon)",
+    "adapt for a technical reviewer (expand acronyms once)",
+    "version for procurement (focus on compliance and risk)",
+
+    # Readability & language control
+    "plain-English rewrite",
+    "plain-English version",
+    "reduce jargon; expand acronyms on first use",
+    "use active voice and shorter sentences",
+    "active voice, shorter sentences",
+    "improve coherence; keep all figures and dates",
+    "fix grammar and wordiness; preserve meaning",
+    "grammar and style fix, same content",
+
+    # Constraint-preserving
+    "keep all facts; no new data — just clearer",
+    "keep the country list identical; rewrite the prose",
+    "same structure, better wording",
+    "don't change numbers or names; polish only",
+    "keep numbers/dates; tighten wording",
+
+    # Format conversions
+    "turn this into an email reply (same content)",
+    "make a one-paragraph abstract",
+    "create a five-line synopsis",
+    "turn this into a Q&A answer format",
+    "Q&A formatted answer, same info",
+
+    # Banking/RFP flavored
+    "make this RFP-ready and concise",
+    "emphasize AR reconciliation benefits; keep details the same",
+    "keep the 'virtual accounts' definition; tighten the rest",
+    "keep citations as is; just polish the wording"
+]
+
+
+
+
+
+
+
+
 Great catch. You can make derailments a non-issue with a two-layer defense:
 
 Backend intent gate (cheap & fast) — detect if the user’s chat instruction is about the current RFP question (rephrase/expand) vs off-topic.
