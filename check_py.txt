@@ -1,0 +1,182 @@
+Here’s a clean, exec-ready structure Api can use with evidence baked in. It’s ordered most impactful → least, framed in business terms, and stays non-technical while keeping proof at hand for drills.
+
+0) One-line message
+
+We’re delivering high-value AI work, but current governance and access constraints are slowing POCs and production by months, putting client delivery at risk. We need a fast lane and your sponsorship.
+
+1) Innovation is being slowed by red tape (POCs treated like production)
+
+Impact (business): POCs that should start in days now stall for ~5–7 months before we can even test, reducing speed to market and client responsiveness.
+
+Evidence (specifics):
+
+AI Factory requires full, production-grade onboarding even for POCs, including:
+
+RAI (Responsible AI): ~1–2 months
+
+DRA (Data Risk Assessment): ~1 month
+
+Solution Intent: ~1–2 months
+
+Governance Committee review: ~1 month
+
+SC IDP onboarding: ~1 month
+→ Total elapsed time: ~5–7 months before a POC can start.
+
+On Mosaic, we only run these gates when a use case is confirmed for production, letting us test quickly first.
+
+What we’ve tried / escalated:
+
+Flagged the mismatch (POC ≠ Production) during RAI/Solution Intent conversations and to CDO/tech points-of-contact; response has been to “move to AI Factory,” with no exception path provided.
+
+What we need from G:
+
+Policy carve-out: Treat POCs differently from production (lightweight checklist, limited scope/data, time-boxed), allowing us to start within days.
+
+2) We can’t access the tools needed to experiment (Hugging Face blocked)
+
+Impact (business): Model experimentation is throttled; we’re stuck with older models, slowing solution quality and time-to-value.
+
+Evidence (specifics):
+
+Hugging Face access is blocked. Every model requires manual, per-model email approval to the CDO team.
+
+Historically, data science could download freely for experimentation; now we cannot.
+
+POCs require trying N models fast; serial email approvals make this impractical.
+
+What we’ve tried / escalated:
+
+Requested re-enablement/whitelisting for a curated set; responses route back to case-by-case approvals.
+
+What we need from G:
+
+Pre-approved allowlist of common OSS models/packages (for POCs) with guardrails; shift from per-model email approvals to policy-based access.
+
+3) Centralized prioritization creates delivery bottlenecks (AI Factory queue)
+
+Impact (business): Even when we do onboard, delivery depends on cross-org prioritization; no direct path to ship urgent client work.
+
+Evidence (specifics):
+
+AI Factory workloads are prioritized by a governance/tech queue, competing with all departments.
+
+There is no fast lane tied to client deadlines or executive sponsorship.
+
+What we’ve tried / escalated:
+
+Asked for clearer SLAs/expedite criteria; response has been “standard governance process.”
+
+What we need from G:
+
+Expedite lane criteria (e.g., client-committed timelines, revenue impact, regulatory deadlines) and time-boxed SLA for approvals.
+
+4) Support for our current path (Mosaic) is weakening
+
+Impact (business): Production deployments take 3–4 days to resolve platform issues instead of ~1 day before, causing avoidable delivery delays.
+
+Evidence (specifics):
+
+Mosaic still enables fast POCs, but support resources have shifted to AI Factory.
+
+Platform issues during deployment now resolve in 3–4 days (previously within a day), unless we escalate repeatedly.
+
+What we’ve tried / escalated:
+
+Raised delays with Mosaic contacts; response cites resource movement to AI Factory.
+
+What we need from G:
+
+Either sustain Mosaic support until AI Factory has a true POC fast lane, or grant us an alternative fast deployment path with similar SLAs.
+
+5) Process pushbacks create noise, not value
+
+Impact (business): Time is spent defending “why not AI Factory” rather than building solutions; team morale and focus suffer.
+
+Evidence (specifics):
+
+In Solution Intent and RAI reviews, the first question is “why not AI Factory?”
+
+Even after we explain POC speed needs, the default answer is still “move to AI Factory,” with no practical mitigation for the delays.
+
+What we’ve tried / escalated:
+
+Documented rationale in forms and meetings; no change in stance or process flexibility.
+
+What we need from G:
+
+Direction to accept Mosaic (or approved alternative) for POCs without repetitive justification, until the fast lane exists.
+
+6) Extra organizational layers slow escalation and resolution
+
+Impact (business): Critical blockers take longer to surface and resolve; accountability is diluted.
+
+Evidence (specifics):
+
+We currently report through two layers before issues reach you; these layers don’t resolve the platform/policy blockers above.
+
+Api proposes placing our team directly under you for sponsorship on time-sensitive AI delivery.
+
+What we’ve tried / escalated:
+
+Raised through the current chain; issues persist (see items 1–5).
+
+What we need from G:
+
+Direct sponsorship (or formalized escalation path to you) for delivery-critical decisions.
+
+Clear, minimal “asks” for G (decision points)
+
+Create a POC fast lane (policy): lightweight checks, restricted data/scope, no full production gates; target days, not months.
+
+Enable curated Hugging Face access for POCs via an allowlist (replace per-model emails).
+
+Set expedite criteria + SLAs for AI Factory (client revenue/deadlines → guaranteed turnaround).
+
+Sustain Mosaic support (or approve an alternate fast path) until the AI Factory fast lane is operational.
+
+Grant direct escalation to you for time-critical delivery blockers.
+
+Anticipated drill-down Q&A (crisp answers)
+
+Q: Why can’t you just use AI Factory like everyone else?
+A: For POCs, AI Factory requires full production gates (RAI, DRA, Solution Intent, Governance, SC IDP) taking ~5–7 months before a test starts. That removes the core benefit of a POC (fast learning). We’re asking for a POC-specific fast lane with proper guardrails.
+
+Q: Did you escalate these concerns already?
+A: Yes—raised in RAI/Solution Intent forums and to CDO/tech contacts. The consistent response is “move to AI Factory” without an exception path for POCs. Hugging Face requests remain per-model email approvals; Mosaic support delays persist after we flagged them.
+
+Q: Why insist on Mosaic now?
+A: Mosaic lets us start POCs quickly and only run heavy governance when moving to production. With AI Factory in its current form and resource shifts, Mosaic is the only practical fast path until a POC lane exists.
+
+Q: Is there a security/compliance risk if we loosen POC gates?
+A: We propose tight guardrails: non-PII or synthetic data, time-boxed pilots, restricted environments, pre-approved model list (Hugging Face allowlist), and go/no-go reviews before any production move.
+
+Q: What’s the single biggest blocker?
+A: POCs treated as production (item #1). Fixing that (plus model access) unlocks speed.
+
+Appendix — Evidence (verbatim for reference)
+
+AI Factory POC onboarding requires:
+
+RAI (Responsible AI) — ~1–2 months
+
+DRA (Data Risk Assessment) — ~1 month
+
+Solution Intent — ~1–2 months
+
+Governance Committee review — ~1 month
+
+SC IDP onboarding — ~1 month
+→ Total ~5–7 months before a POC can even begin.
+
+Access constraints:
+
+ITAM ID required to be on AI Factory; historically reserved for TTO tech teams. Our team tried and could not obtain an ITAM ID.
+
+Hugging Face access blocked; now requires per-model email approvals to CDO. Previously open for data science downloads.
+
+Operational impacts:
+
+Mosaic support delays: production deployment issues now 3–4 days to resolve (used to be ~1 day) unless we escalate.
+
+Process pushback in Solution Intent/RAI: first question is “why not AI Factory?”; justification required repeatedly; no action taken on our feedback about POC speed.
