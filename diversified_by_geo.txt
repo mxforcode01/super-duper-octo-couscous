@@ -1,204 +1,185 @@
-from qdrant_client import models
-
-def build_filter_from_metadata(
-    meta: dict,
-    *,
-    geo_or_union: bool = True,   # (country OR region) if True; else expand regions yourself first
-) -> models.Filter | None:
-    """
-    meta example:
-      {"region": ["ASIA"], "country": ["SINGAPORE","MALAYSIA"],
-       "client_type": ["CORPORATES"], "topic": ["S2B"], "product": ["CASH"]}
-    Returns a Qdrant Filter (or None if no constraints).
-    """
-    meta = {k.lower(): v for k, v in (meta or {}).items() if v}
-
-    should = []
-    must = []
-
-    # --- GEO ---
-    countries = [c for c in meta.get("country", []) if c]
-    regions   = [r for r in meta.get("region", []) if r]
-    if geo_or_union and (countries or regions):
-        # (country IN ...) OR (region IN ...)
-        if countries:
-            should.append(models.FieldCondition(
-                key="country", match=models.MatchAny(any=countries)
-            ))
-        if regions:
-            should.append(models.FieldCondition(
-                key="region", match=models.MatchAny(any=regions)
-            ))
-    elif countries:
-        # country-only constraint
-        must.append(models.FieldCondition(
-            key="country", match=models.MatchAny(any=countries)
-        ))
-    elif regions:
-        # region-only constraint
-        must.append(models.FieldCondition(
-            key="region", match=models.MatchAny(any=regions)
-        ))
-
-    # --- OTHER KEYS (AND across keys, OR within a key) ---
-    for key in ("product", "client_type", "topic"):
-        vals = [v for v in meta.get(key, []) if v]
-        if vals:
-            must.append(models.FieldCondition(
-                key=key, match=models.MatchAny(any=vals)
-            ))
-
-    if not (should or must):
-        return None
-    return models.Filter(must=must or None, should=should or None)
-
-
 from math import ceil
 from qdrant_client import models
 
-def diversified_by_meta(
-    client,
-    collection_name: str,
-    query_vec,
-    meta: dict | None = None,
-    *,
-    final_k: int = 10,             # hard cap for your LLM context
-    pool_mult: int = 2,            # over-fetch
-    single_country_pool: int = 20, # if only one country involved
-    per_country_min: int = 1,
-    per_country_max: int = 6,
-    group_by_key: str = "country", # diversification dimension
-    region_to_countries: dict[str, list[str]] | None = None,
-    respect_user_country_order: bool = True,
-) -> list:
-    """
-    Returns up to `final_k` items, diversified by `group_by_key` (default 'country').
-    AND/OR rules are set in build_filter_from_metadata.
-    """
-    meta = meta or {}
-    base_filter = build_filter_from_metadata(meta, geo_or_union=True)
+CRITICAL_KEYS = ("region", "country", "product", "client_type", "topic")
 
-    # Estimate #countries to set a sensible group_size (for country grouping)
-    countries = [c for c in (meta.get("country") or []) if c]
-    regions   = [r for r in (meta.get("region") or []) if r]
-    expanded_countries = set(countries)
+def _norm_meta(meta: dict | None) -> dict:
+    meta = meta or {}
+    # Keep only known keys; drop empties; normalize to lists of strings
+    out = {}
+    for k in CRITICAL_KEYS:
+        v = meta.get(k, [])
+        if v:
+            vals = [str(x).strip() for x in (v if isinstance(v, (list, tuple, set)) else [v]) if str(x).strip()]
+            if vals:
+                out[k] = vals
+    return out
+
+def build_filter(meta: dict, geo_or_union: bool = True) -> models.Filter | None:
+    """
+    AND across keys, OR within a key.
+    Geo logic: (country IN ...) OR (region IN ...) if geo_or_union else keep them in 'must'.
+    """
+    must, should = [], []
+
+    countries = meta.get("country", [])
+    regions   = meta.get("region", [])
+    if geo_or_union and (countries or regions):
+        if countries:
+            should.append(models.FieldCondition(key="country", match=models.MatchAny(any=countries)))
+        if regions:
+            should.append(models.FieldCondition(key="region", match=models.MatchAny(any=regions)))
+    else:
+        if countries:
+            must.append(models.FieldCondition(key="country", match=models.MatchAny(any=countries)))
+        if regions:
+            must.append(models.FieldCondition(key="region", match=models.MatchAny(any=regions)))
+
+    for k in ("product", "client_type", "topic"):
+        vals = meta.get(k, [])
+        if vals:
+            must.append(models.FieldCondition(key=k, match=models.MatchAny(any=vals)))
+
+    if not (must or should):
+        return None
+    return models.Filter(must=must or None, should=should or None)
+
+def _grouped_search_country(
+    client, collection_name, query_vec, qfilter, *, pool_k, countries, per_country_min=1, per_country_max=6,
+    single_country_pool=20, region_to_countries=None, regions=None, respect_user_country_order=True
+):
+    # Estimate number of countries for adaptive group_size
+    expanded = set(countries or [])
     if region_to_countries and regions:
         for r in regions:
-            expanded_countries.update(region_to_countries.get(r, []))
+            expanded.update(region_to_countries.get(r, []))
+    n_countries = len(expanded) if expanded else max(1, len(countries or []) or len(regions or []) or 1)
 
-    n_countries = len(expanded_countries) if expanded_countries else max(1, len(countries) or len(regions) or 1)
-
-    pool_k = max(final_k * pool_mult, final_k)
     if n_countries == 1:
         group_size = min(single_country_pool, per_country_max or single_country_pool)
     else:
         group_size = max(per_country_min, min(per_country_max, ceil(pool_k / n_countries)))
 
-    # Grouped search
     grouped = client.search_groups(
         collection_name=collection_name,
         query_vector=query_vec,
-        query_filter=base_filter,
-        group_by=group_by_key,
+        query_filter=qfilter,
+        group_by="country",
         group_size=group_size,
         limit=1024,
         with_payload=True,
         with_vectors=False,
     )
 
-    # Collect buckets robustly
     buckets = {}
     for g in getattr(grouped, "groups", []) or []:
         gid = getattr(g, "group_id", getattr(g, "id", None))
         if gid is not None:
             buckets[gid] = list(g.hits)
 
-    # If no groups (e.g., field missing or no matches), fall back to ungrouped
+    # Round-robin to pool_k
     if not buckets:
-        hits = client.search(
-            collection_name=collection_name,
-            query_vector=query_vec,
-            query_filter=base_filter,
-            limit=pool_k * 2,
-            with_payload=True,
-            with_vectors=False,
-        )
-        hits.sort(key=lambda h: h.score, reverse=True)
-        return hits[:final_k]
+        return []
 
-    # Round-robin order preference: explicit countries first
-    if group_by_key == "country" and respect_user_country_order and countries:
+    if respect_user_country_order and countries:
         order = [c for c in countries if c in buckets] + [c for c in buckets.keys() if c not in countries]
     else:
         order = list(buckets.keys())
 
-    # Build shortlist
-    shortlist = []
-    while len(shortlist) < pool_k and any(buckets[k] for k in order):
-        for k in order:
-            if buckets.get(k):
-                shortlist.append(buckets[k].pop(0))
-                if len(shortlist) >= pool_k:
+    out = []
+    while len(out) < pool_k and any(buckets[c] for c in order):
+        for c in order:
+            if buckets.get(c):
+                out.append(buckets[c].pop(0))
+                if len(out) >= pool_k:
                     break
+    return out
 
-    # Global sort + final cap
-    shortlist.sort(key=lambda h: h.score, reverse=True)
-    return shortlist[:final_k]
-
-
-def diversified_by_meta_with_fallback(
+def diversified_by_meta_relax(
     client,
     collection_name: str,
     query_vec,
     meta: dict | None = None,
     *,
-    final_k: int = 10,
-    pool_mult: int = 2,
-    pool_target: int = 20,      # aim to gather this many before trimming
-    **kwargs
-) -> list:
+    final_k: int = 20,          # your hard cap for the LLM
+    pool_mult: int = 2,         # over-fetch factor before trimming
+    relax_order: list[str] = ("topic", "product", "client_type", "region", "country"),
+    geo_union: bool = True,     # (country OR region)
+    region_to_countries: dict[str, list[str]] | None = None,
+    per_country_min: int = 1,
+    per_country_max: int = 6,
+    single_country_pool: int = 20,
+    respect_user_country_order: bool = True,
+):
     """
-    1) Diversify using all provided metadata (geo + others).
-    2) If fewer than pool_target candidates, drop geo constraints and fill globally.
+    Progressive relaxation in the specified order until we collect at least final_k (or pool_k) candidates.
+    Diversifies by 'country' when geo constraints present; otherwise falls back to global search.
+    Returns <= final_k points sorted by score.
     """
-    meta = meta or {}
+    meta = _norm_meta(meta)
+    pool_k = max(final_k * pool_mult, final_k)
 
-    shortlist = diversified_by_meta(
-        client=client,
-        collection_name=collection_name,
-        query_vec=query_vec,
-        meta=meta,
-        final_k=max(final_k, pool_target),   # grab more; we'll trim later
-        pool_mult=kwargs.get("pool_mult", pool_mult),
-        single_country_pool=kwargs.get("single_country_pool", 20),
-        per_country_min=kwargs.get("per_country_min", 1),
-        per_country_max=kwargs.get("per_country_max", 6),
-        group_by_key=kwargs.get("group_by_key", "country"),
-        region_to_countries=kwargs.get("region_to_countries"),
-        respect_user_country_order=kwargs.get("respect_user_country_order", True),
-    )
+    def run_once(active_meta: dict):
+        qfilter = build_filter(active_meta, geo_or_union=geo_union)
+        countries = active_meta.get("country", [])
+        regions = active_meta.get("region", [])
 
-    # If not enough, drop only geo constraints and keep product/topic/client_type (if any)
-    if len(shortlist) < pool_target:
-        # Build a non-geo filter from meta
-        non_geo = {k: v for k, v in meta.items() if k and k.lower() not in ("country", "region")}
-        non_geo_filter = build_filter_from_metadata({"region": [], "country": [], **non_geo}, geo_or_union=True)
+        if countries or regions:
+            # country-diversified
+            hits = _grouped_search_country(
+                client, collection_name, query_vec, qfilter,
+                pool_k=pool_k, countries=countries, per_country_min=per_country_min,
+                per_country_max=per_country_max, single_country_pool=single_country_pool,
+                region_to_countries=region_to_countries, regions=regions,
+                respect_user_country_order=respect_user_country_order
+            )
+        else:
+            # no geo → single global search
+            hits = client.search(
+                collection_name=collection_name,
+                query_vector=query_vec,
+                query_filter=qfilter,
+                limit=pool_k * 2,
+                with_payload=True,
+                with_vectors=False,
+            )
+            hits = sorted(hits, key=lambda h: h.score, reverse=True)[:pool_k]
+        return hits
 
-        fill_hits = client.search(
+    # 1) Strict pass
+    shortlist = run_once(meta)
+
+    # 2) Relax progressively until we have enough candidates or run out of keys
+    if len(shortlist) < final_k:
+        active = dict(meta)  # copy
+        for key in relax_order:
+            if key in active:
+                active.pop(key, None)
+                hits = run_once(active)
+                # merge (dedupe by id)
+                seen = {h.id for h in shortlist}
+                for h in hits:
+                    if h.id not in seen:
+                        shortlist.append(h)
+                        seen.add(h.id)
+                if len(shortlist) >= final_k:
+                    break
+
+    # 3) If still short, drop all filters (pure semantic fallback)
+    if len(shortlist) < final_k:
+        fill = client.search(
             collection_name=collection_name,
             query_vector=query_vec,
-            query_filter=non_geo_filter,
-            limit=pool_target * 2,
+            limit=final_k * 3,
             with_payload=True,
             with_vectors=False,
         )
-
         seen = {h.id for h in shortlist}
-        for h in fill_hits:
+        for h in fill:
             if h.id not in seen:
                 shortlist.append(h)
                 seen.add(h.id)
-            if len(shortlist) >= pool_target:
+            if len(shortlist) >= final_k:
                 break
 
     # Final global sort + cap
@@ -206,20 +187,14 @@ def diversified_by_meta_with_fallback(
     return shortlist[:final_k]
 
 
-# 4a) Full meta
+# Example 1
 meta1 = {"region": ["ASIA"], "country": ["SINGAPORE"], "client_type": ["CORPORATES"], "topic": ["S2B"], "product": ["CASH"]}
-results1 = diversified_by_meta_with_fallback(
-    client, "my_docs_bge", query_vec, meta=meta1, final_k=10, pool_target=20
-)
+res1 = diversified_by_meta_relax(client, "my_docs_bge", query_vec, meta=meta1, final_k=20)
 
-# 4b) Geo only
+# Example 2
 meta2 = {"region": ["ASIA"], "country": ["SINGAPORE"]}
-results2 = diversified_by_meta_with_fallback(
-    client, "my_docs_bge", query_vec, meta=meta2, final_k=10, pool_target=20
-)
+res2 = diversified_by_meta_relax(client, "my_docs_bge", query_vec, meta=meta2, final_k=20)
 
-# 4c) No filters ({}): behaves like a plain diversified search, falling back to global
+# Example 3 (no filters)
 meta3 = {}
-results3 = diversified_by_meta_with_fallback(
-    client, "my_docs_bge", query_vec, meta=meta3, final_k=10, pool_target=20
-)
+res3 = diversified_by_meta_relax(client, "my_docs_bge", query_vec, meta=meta3, final_k=20)
