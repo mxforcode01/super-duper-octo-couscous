@@ -1,0 +1,188 @@
+"""
+ChromaDB Setup and Usage Script
+"""
+
+# 1. Install necessary packages
+# Run: pip install chromadb sentence-transformers
+
+import chromadb
+from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
+import os
+
+# Sample data
+text_chunks = [
+    {
+        'text': 'Countries that support ACH payment are Singapore, Malaysia. Countries that do not support are Vietnam, Myanmar, Bangladesh',
+        'metadata': {
+            'region': 'ASIA',
+            'country': 'ALL',
+            'topic': 'ACH',
+            'product': 'CASH',
+            'client_type': 'corporates',
+            'location': 'link'
+        }
+    },
+    {
+        'text': 'Countries that support RTGS payment are Singapore. Countries that do not support are Malaysia, Myanmar, Bangladesh',
+        'metadata': {
+            'region': 'ASIA',
+            'country': 'ALL',
+            'topic': 'RTGS',
+            'product': 'CASH',
+            'client_type': 'corporates',
+            'location': 'link'
+        }
+    }
+]
+
+# Initialize embedding model
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# 2. Set up database with persistent storage
+db_path = "./chromadb_store"
+client = chromadb.PersistentClient(
+    path=db_path,
+    settings=Settings(
+        anonymized_telemetry=False,
+        allow_reset=True
+    )
+)
+
+print(f"✅ ChromaDB client created. Data will be stored in: {db_path}")
+
+# 3. Create collection and dump text chunks
+collection_name = "text_chunks"
+
+# Delete collection if exists for fresh start
+try:
+    client.delete_collection(name=collection_name)
+    print(f"🗑️  Deleted existing collection '{collection_name}'")
+except:
+    pass
+
+# Create new collection with cosine similarity
+collection = client.create_collection(
+    name=collection_name,
+    metadata={"hnsw:space": "cosine"}  # Options: "cosine", "l2", "ip"
+)
+
+# Prepare and add documents
+documents = []
+metadatas = []
+ids = []
+embeddings = []
+
+for i, chunk in enumerate(text_chunks):
+    documents.append(chunk['text'])
+    metadatas.append(chunk['metadata'])
+    ids.append(f"doc_{i}")
+    embeddings.append(model.encode(chunk['text']).tolist())
+
+# Add to collection
+collection.add(
+    documents=documents,
+    metadatas=metadatas,
+    ids=ids,
+    embeddings=embeddings
+)
+
+print(f"📊 Added {len(documents)} chunks to collection '{collection_name}'")
+print(f"📝 Collection count: {collection.count()} documents")
+
+# 4. Store is automatic - ChromaDB persists to disk
+
+# 5. Access database from local directory
+# Reconnect to demonstrate persistence
+client_reconnect = chromadb.PersistentClient(path=db_path)
+collection_reconnect = client_reconnect.get_collection(name=collection_name)
+
+print(f"\n📂 Reconnected to database from: {db_path}")
+print(f"📋 Available collections: {[c.name for c in client_reconnect.list_collections()]}")
+print(f"📝 Documents in collection: {collection_reconnect.count()}")
+
+# 6. Search via sample query
+def search(query, collection, n_results=3, where=None, where_document=None):
+    """Search for similar text with optional filtering"""
+    # Generate query embedding
+    query_embedding = model.encode(query).tolist()
+    
+    # Perform search
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=n_results,
+        where=where,
+        where_document=where_document
+    )
+    
+    return results
+
+# Example searches
+print("\n🔍 Search Examples:")
+print("-" * 50)
+
+# Search 1: Basic semantic search
+query1 = "Which countries support ACH payment?"
+results1 = search(query1, collection_reconnect, n_results=2)
+print(f"\nQuery: {query1}")
+for i in range(len(results1['documents'][0])):
+    print(f"  - Distance: {results1['distances'][0][i]:.4f}")
+    print(f"    Text: {results1['documents'][0][i][:100]}...")
+    print(f"    Metadata: {results1['metadatas'][0][i]}")
+    print(f"    ID: {results1['ids'][0][i]}")
+
+# Search 2: With metadata filtering
+query2 = "payment systems"
+metadata_filter = {"topic": "RTGS"}
+results2 = search(query2, collection_reconnect, n_results=2, where=metadata_filter)
+print(f"\nQuery: {query2} (filtered by topic='RTGS')")
+for i in range(len(results2['documents'][0])):
+    print(f"  - Distance: {results2['distances'][0][i]:.4f}")
+    print(f"    Text: {results2['documents'][0][i][:100]}...")
+    print(f"    Topic: {results2['metadatas'][0][i]['topic']}")
+
+# Search 3: Complex metadata filtering (AND condition)
+query3 = "countries"
+complex_filter = {
+    "$and": [
+        {"region": "ASIA"},
+        {"product": "CASH"}
+    ]
+}
+results3 = search(query3, collection_reconnect, n_results=2, where=complex_filter)
+print(f"\nQuery: {query3} (filtered by region='ASIA' AND product='CASH')")
+for i in range(len(results3['documents'][0])):
+    print(f"  - Text: {results3['documents'][0][i][:100]}...")
+    print(f"    Metadata: {results3['metadatas'][0][i]}")
+
+# Search 4: Text content filtering
+query4 = "payment"
+text_filter = {"$contains": "Singapore"}
+results4 = search(query4, collection_reconnect, n_results=2, where_document=text_filter)
+print(f"\nQuery: {query4} (documents containing 'Singapore')")
+for i in range(len(results4['documents'][0])):
+    print(f"  - Text: {results4['documents'][0][i][:100]}...")
+
+# Additional operations
+print("\n📊 Additional Operations:")
+
+# Get all documents
+all_docs = collection_reconnect.get()
+print(f"Total documents: {len(all_docs['ids'])}")
+
+# Get specific document by ID
+specific_doc = collection_reconnect.get(ids=["doc_0"])
+print(f"Retrieved document by ID: {specific_doc['documents'][0][:50]}...")
+
+# Update metadata for a document
+collection_reconnect.update(
+    ids=["doc_0"],
+    metadatas={"region": "ASIA", "updated": "true", "country": "ALL", 
+               "topic": "ACH", "product": "CASH", "client_type": "corporates", 
+               "location": "link"}
+)
+print("✅ Updated metadata for doc_0")
+
+# Peek at first few documents
+peek_results = collection_reconnect.peek(limit=2)
+print(f"First 2 documents (peek): {len(peek_results['ids'])} documents")
