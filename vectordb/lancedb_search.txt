@@ -1,0 +1,276 @@
+# pip install lancedb pyarrow
+
+from __future__ import annotations
+from typing import List, Dict, Any, Optional
+from math import ceil
+import re
+
+# ---------- Normalization & filter building ----------
+
+CRITICAL_KEYS = ("region", "country", "product", "client_type", "topic")
+
+def _norm_meta(meta: Optional[Dict[str, List[str]]]) -> Dict[str, List[str]]:
+    meta = meta or {}
+    out: Dict[str, List[str]] = {}
+    for k in CRITICAL_KEYS:
+        vals = meta.get(k, [])
+        if not vals:
+            continue
+        if isinstance(vals, (list, tuple, set)):
+            cleaned = [str(v).strip() for v in vals if str(v).strip()]
+        else:
+            cleaned = [str(vals).strip()]
+        if cleaned:
+            out[k] = cleaned
+    return out
+
+def _sql_list(vals: List[str]) -> str:
+    # safely quote simple keywords; adjust if you have quotes in values
+    q = []
+    for v in vals:
+        v = v.replace("'", "''")
+        q.append(f"'{v}'")
+    return "[" + ",".join(q) + "]"
+
+def build_where_from_meta(meta: Dict[str, List[str]], geo_or_union: bool = True) -> Optional[str]:
+    """
+    LanceDB uses a simple SQL-like filter string in .where(...).
+    We implement:
+      geo: (country IN (...) OR region IN (...))   if geo_or_union
+      other keys (AND across keys, OR within a key)
+    Returns None if no constraints.
+    """
+    parts_and = []
+
+    # GEO
+    countries = meta.get("country", [])
+    regions   = meta.get("region", [])
+    if geo_or_union and (countries or regions):
+        parts_or = []
+        if countries:
+            parts_or.append(f"country IN {_sql_list(countries)}")
+        if regions:
+            parts_or.append(f"region IN {_sql_list(regions)}")
+        parts_and.append("(" + " OR ".join(parts_or) + ")")
+    else:
+        if countries:
+            parts_and.append(f"country IN {_sql_list(countries)}")
+        if regions:
+            parts_and.append(f"region IN {_sql_list(regions)}")
+
+    # OTHER FIELDS
+    for key in ("product", "client_type", "topic"):
+        vals = meta.get(key, [])
+        if vals:
+            parts_and.append(f"{key} IN {_sql_list(vals)}")
+
+    if not parts_and:
+        return None
+    return " AND ".join(parts_and)
+
+# ---------- Score handling & diversification ----------
+
+def _score_of(row: Dict[str, Any]) -> float:
+    """
+    LanceDB search results usually include 'score' (higher is better for cosine).
+    Some versions expose '_distance' (lower is better). Normalize to 'higher is better'.
+    """
+    if "score" in row and isinstance(row["score"], (int, float)):
+        return float(row["score"])
+    if "_distance" in row and isinstance(row["_distance"], (int, float)):
+        return float(-row["_distance"])  # invert distance so higher is better
+    # fallback if nothing present
+    return float(row.get("similarity", 0.0))  # or 0.0
+
+def _bucket_by(rows: List[Dict[str, Any]], key: str) -> Dict[str, List[Dict[str, Any]]]:
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        k = r.get(key, None)
+        if k is None:
+            k = "__UNKNOWN__"
+        buckets.setdefault(k, []).append(r)
+    # ensure each bucket sorted by score desc
+    for k in buckets:
+        buckets[k].sort(key=_score_of, reverse=True)
+    return buckets
+
+def _round_robin_from_buckets(buckets: Dict[str, List[Dict[str, Any]]],
+                              order: List[str],
+                              need: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    while len(out) < need and any(buckets.get(k) for k in order):
+        for k in order:
+            if buckets.get(k):
+                out.append(buckets[k].pop(0))
+                if len(out) >= need:
+                    break
+    return out
+
+def _lance_search(tbl, query_vec, where: Optional[str], limit: int, select_cols: Optional[List[str]] = None):
+    """
+    Runs a LanceDB vector search with optional filter.
+    Returns a list[dict] with at least: id (if present), country/region fields (if present), and score/_distance.
+    """
+    q = tbl.search(query_vec).metric("cosine")  # change metric if needed
+    if where:
+        q = q.where(where)
+    if select_cols:
+        q = q.select(select_cols)
+    rows = q.limit(limit).to_list()  # each row is a dict
+    return rows
+
+def diversified_by_meta_lance(
+    tbl,
+    query_vec,
+    meta: Optional[Dict[str, List[str]]] = None,
+    *,
+    final_k: int = 10,              # hard cap to feed your LLM
+    pool_mult: int = 2,             # over-fetch multiplier
+    diversify_on: str = "country",  # dimension to diversify by
+    geo_or_union: bool = True,
+    respect_user_country_order: bool = True,
+    select_cols: Optional[List[str]] = None,   # e.g., ["id","country","region","text","score"]
+):
+    """
+    Diversify by 'country' if present in results; otherwise, just take top-k by score.
+    """
+    meta = _norm_meta(meta)
+    where = build_where_from_meta(meta, geo_or_union=geo_or_union)
+    pool_k = max(final_k * pool_mult, final_k)
+
+    # 1) Fetch a generous candidate pool (single pass)
+    #    Get more than pool_k because we will bucket then round-robin.
+    raw = _lance_search(tbl, query_vec, where, limit=pool_k * 5, select_cols=select_cols)
+
+    if not raw:
+        return []
+
+    # 2) If we have the diversify key, bucket & round-robin
+    if diversify_on and any(diversify_on in r for r in raw):
+        buckets = _bucket_by(raw, diversify_on)
+
+        # determine country order: explicit countries first, then the rest
+        if diversify_on == "country" and respect_user_country_order and "country" in meta:
+            order = [c for c in meta["country"] if c in buckets] + [c for c in buckets.keys() if c not in meta["country"]]
+        else:
+            order = list(buckets.keys())
+
+        shortlist = _round_robin_from_buckets(buckets, order, need=pool_k)
+    else:
+        # no diversify key in rows → just sort by score
+        shortlist = sorted(raw, key=_score_of, reverse=True)[:pool_k]
+
+    # 3) Final global sort + cap
+    shortlist.sort(key=_score_of, reverse=True)
+    return shortlist[:final_k]
+
+def diversified_by_meta_relax_lance(
+    tbl,
+    query_vec,
+    meta: Optional[Dict[str, List[str]]] = None,
+    *,
+    final_k: int = 20,                    # your maximum window (e.g., 20 or 10)
+    pool_mult: int = 2,
+    relax_order: List[str] = ("topic", "product", "client_type", "region", "country"),
+    diversify_on: str = "country",
+    geo_or_union: bool = True,
+    respect_user_country_order: bool = True,
+    select_cols: Optional[List[str]] = None,
+):
+    """
+    Progressive relaxation: topic → product → client_type → region → country
+    until we have at least final_k. Always returns ≤ final_k diversified results.
+    """
+    meta = _norm_meta(meta)
+    pool_k = max(final_k * pool_mult, final_k)
+
+    def run_once(active_meta: Dict[str, List[str]]):
+        where = build_where_from_meta(active_meta, geo_or_union=geo_or_union)
+        raw = _lance_search(tbl, query_vec, where, limit=pool_k * 5, select_cols=select_cols)
+        if not raw:
+            return []
+
+        # Prefer diversification if the key exists in rows
+        if diversify_on and any(diversify_on in r for r in raw):
+            buckets = _bucket_by(raw, diversify_on)
+
+            if diversify_on == "country" and respect_user_country_order and "country" in active_meta:
+                order = [c for c in active_meta["country"] if c in buckets] + [c for c in buckets.keys() if c not in active_meta["country"]]
+            else:
+                order = list(buckets.keys())
+
+            short = _round_robin_from_buckets(buckets, order, need=pool_k)
+        else:
+            short = sorted(raw, key=_score_of, reverse=True)[:pool_k]
+
+        # keep globally best pool_k
+        short.sort(key=_score_of, reverse=True)
+        return short[:pool_k]
+
+    # 1) Strict
+    shortlist = run_once(meta)
+
+    # 2) Relax progressively
+    if len(shortlist) < final_k:
+        active = dict(meta)
+        for key in relax_order:
+            if key in active:
+                active.pop(key, None)
+                hits = run_once(active)
+                # merge de-duped (by 'id' if present, else by object id)
+                seen = set()
+                def _rid(r): return r.get("id", id(r))
+                for r in shortlist:
+                    seen.add(_rid(r))
+                for r in hits:
+                    rid = _rid(r)
+                    if rid not in seen:
+                        shortlist.append(r)
+                        seen.add(rid)
+                # early stop
+                if len(shortlist) >= final_k:
+                    break
+
+    # 3) Final fallback: drop all filters (pure semantic)
+    if len(shortlist) < final_k:
+        raw = _lance_search(tbl, query_vec, where=None, limit=final_k * 5, select_cols=select_cols)
+        raw.sort(key=_score_of, reverse=True)
+        seen = set()
+        def _rid(r): return r.get("id", id(r))
+        for r in shortlist:
+            seen.add(_rid(r))
+        for r in raw:
+            rid = _rid(r)
+            if rid not in seen:
+                shortlist.append(r)
+                seen.add(rid)
+            if len(shortlist) >= final_k:
+                break
+
+    # Final cap
+    shortlist.sort(key=_score_of, reverse=True)
+    return shortlist[:final_k]
+
+
+#############################################
+import lancedb
+db = lancedb.connect("/path/to/my_lancedb")
+tbl = db.open_table("my_docs_bge")  # your table name
+
+# query embedding vector (list[float]); be sure the same model used to build the table vectors
+query_vec = [0.0] * 768  # placeholder
+
+# 1) Full meta
+meta1 = {"region": ["ASIA"], "country": ["SINGAPORE"], "client_type": ["CORPORATES"], "topic": ["S2B"], "product": ["CASH"]}
+res1 = diversified_by_meta_relax_lance(
+    tbl, query_vec, meta=meta1, final_k=20, pool_mult=2,
+    select_cols=["id","country","region","product","client_type","topic","score"]
+)
+
+# 2) Geo only
+meta2 = {"region": ["ASIA"], "country": ["SINGAPORE"]}
+res2 = diversified_by_meta_relax_lance(tbl, query_vec, meta=meta2, final_k=20)
+
+# 3) No filters
+meta3 = {}
+res3 = diversified_by_meta_relax_lance(tbl, query_vec, meta=meta3, final_k=20)
