@@ -1,0 +1,117 @@
+def dump_into_lancedb(text_chunks, db_path, table_name):
+    def prepare_data(chunks):
+        """Convert text chunks to LanceDB format"""
+        data = []
+        for i, chunk in enumerate(chunks):
+            # Generate embedding
+            embedding = model.encode(chunk['text'])
+            
+            # Create record with text, embedding, and metadata
+            record = {
+                'id': i,
+                'text': chunk['text'],
+                'vector': embedding,
+                **chunk['metadata']  # Flatten metadata into columns
+            }
+            data.append(record)
+        
+        return data
+    
+    db = lancedb.connect(db_path)
+    # Drop table if exists for fresh start
+    if table_name in db.table_names():
+        db.drop_table(table_name)
+    
+    # Prepare data and create table
+    data = prepare_data(text_chunks)
+    df = pd.DataFrame(data)
+    table = db.create_table(table_name, df)
+
+def access_lancedb(db_path, table_name):
+    db = lancedb.connect(db_path)
+    table = db.open_table(table_name)
+    return db, table
+
+def search(query, table, top_k=3, filter_dict=None):
+    """Search for similar text with optional metadata filtering"""
+    # Generate query embedding
+    query_embedding = model.encode(query)
+    
+    # Build search query
+    search_query = table.search(query_embedding).limit(top_k)
+    
+    # Apply metadata filters if provided
+    if filter_dict:
+        filter_string = " AND ".join([f"{k} = '{v}'" for k, v in filter_dict.items()])
+        search_query = search_query.where(filter_string)
+    
+    # Execute search
+    results = search_query.to_pandas()
+    
+    return results
+
+db, tbl = access_lancedb(db_dir + db_path, table_name)
+search(query, tbl, top_k=3, filter_dict=None)
+
+
+################################################
+def dump_into_qdrant(chunks, collection_name = "my_docs_bge"):
+    client = QdrantClient(path=qdrant_path)  # Persists changes to disk, fast prototyping
+    client.recreate_collection(collection_name = collection_name, vectors_config = VectorParams(size = 768, distance = Distance.COSINE))
+    model = SentenceTransformer(embedding_path)
+    texts = [c['text'] for c in chunks]
+    payloads = [{'text':c['text'], **c['metadata']} for c in chunks]
+    vectors = model.encode(texts).tolist()
+    ids = list(range(len(chunks)))
+    client.upload_collection(
+        collection_name = "my_docs_bge",
+        vectors = vectors,
+        payload = payloads,
+        ids = ids,
+    )
+    return
+
+def access_qdrant():
+    client = QdrantClient(path = qdrant_path)
+    return client
+
+def make_filter(d:dict):
+    if not d:
+        return None
+    return Filter(must = [FieldCondition(key = key, match = MatchValue(value = value)) for key, value in d.items()])
+
+def search_qdrant(query, client, collection_name = "my_docs_bge", top_k = 20, stages:list[dict] = None):
+    if stages is None:
+        stages = [{}]
+    
+    model = SentenceTransformer(embedding_path)
+    query = "query: "+str(query)
+    query_vector = model.encode(query, normalize_embeddings = True).tolist()
+    results = []
+    seen_ids = set()
+    
+    # Start with strict filter first then gradually relax the filters
+    for stage in stages:
+        need = top_k - len(results)
+        if need<=0:
+            break
+        flt = make_filter(stage)
+        hits = client.search(
+            collection_name = collection_name, 
+            query_vector = query_vector, 
+            query_filter = flt,
+            limit = need*3,
+            with_payload = True,
+        )
+        for pt in hits:
+            pid = pt.id
+            if pid not in seen_ids:
+                results.append(pt)
+                seen_ids.add(pid)
+                if len(results)>=top_k:
+                    break
+    return results
+
+qdrant_db = access_qdrant()
+search_qdrant(query, qdrant_db)
+
