@@ -143,3 +143,357 @@ asia_cash_records = asia_cash_records[
     (asia_cash_records['product'] == 'CASH')
 ]
 print(f"Records for ASIA region with CASH product: {len(asia_cash_records)}")
+
+############################################################################
+############################################################################
+"""
+LanceDB Progressive Filter Relaxation System (Functions Only)
+Automatically relaxes filters to ensure meaningful results
+"""
+
+# pip install lancedb sentence-transformers pandas
+
+import time
+from typing import Dict, Optional, Tuple, List
+
+import lancedb
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+
+# -----------------------------
+# Config
+# -----------------------------
+DB_PATH = "./lancedb_progressive"
+TABLE_NAME = "text_chunks"
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+MAX_RESULTS_DEFAULT = 20
+
+# First-removed -> last-removed (lower number = remove earlier)
+FILTER_PRIORITY_DEFAULT = {
+    "topic": 1,
+    "product": 2,
+    "client_type": 3,
+    "region": 4,
+    "country": 5,
+}
+
+# -----------------------------
+# Sample data (for testing)
+# -----------------------------
+text_chunks = [
+    {
+        'text': 'S2B payment implementation in Singapore requires specific corporate authentication for cash products',
+        'metadata': {
+            'region': 'ASIA', 'country': 'SINGAPORE', 'topic': 'S2B',
+            'product': 'CASH', 'client_type': 'CORPORATES', 'location': 'link1'
+        }
+    },
+    {
+        'text': 'S2B services are available across all Asian countries for retail clients using FX products',
+        'metadata': {
+            'region': 'ASIA', 'country': 'ALL', 'topic': 'S2B',
+            'product': 'FX', 'client_type': 'RETAIL', 'location': 'link2'
+        }
+    },
+    {
+        'text': 'ACH payment system in Singapore supports both corporate and retail segments for cash transactions',
+        'metadata': {
+            'region': 'ASIA', 'country': 'SINGAPORE', 'topic': 'ACH',
+            'product': 'CASH', 'client_type': 'CORPORATES', 'location': 'link3'
+        }
+    },
+    {
+        'text': 'RTGS implementation across ASIA region for all countries supporting securities products',
+        'metadata': {
+            'region': 'ASIA', 'country': 'ALL', 'topic': 'RTGS',
+            'product': 'SECURITIES', 'client_type': 'CORPORATES', 'location': 'link4'
+        }
+    },
+    {
+        'text': 'S2B corporate services expanded to Malaysia and Thailand for cash products',
+        'metadata': {
+            'region': 'ASIA', 'country': 'MALAYSIA', 'topic': 'S2B',
+            'product': 'CASH', 'client_type': 'CORPORATES', 'location': 'link5'
+        }
+    },
+    {
+        'text': 'European S2B implementation for corporate clients in Germany using FX products',
+        'metadata': {
+            'region': 'EUROPE', 'country': 'GERMANY', 'topic': 'S2B',
+            'product': 'FX', 'client_type': 'CORPORATES', 'location': 'link6'
+        }
+    },
+    {
+        'text': 'SWIFT payments available in USA for institutional clients with securities',
+        'metadata': {
+            'region': 'AMERICAS', 'country': 'USA', 'topic': 'SWIFT',
+            'product': 'SECURITIES', 'client_type': 'INSTITUTIONAL', 'location': 'link7'
+        }
+    },
+    {
+        'text': 'Wire transfer services for retail clients in Canada for cash transactions',
+        'metadata': {
+            'region': 'AMERICAS', 'country': 'CANADA', 'topic': 'WIRE',
+            'product': 'CASH', 'client_type': 'RETAIL', 'location': 'link8'
+        }
+    },
+    {
+        'text': 'Payment infrastructure updates for Singapore corporate cash management',
+        'metadata': {
+            'region': 'ASIA', 'country': 'SINGAPORE', 'topic': 'INFRASTRUCTURE',
+            'product': 'CASH', 'client_type': 'CORPORATES', 'location': 'link9'
+        }
+    },
+    {
+        'text': 'Global payment trends affecting all regions and client types',
+        'metadata': {
+            'region': 'GLOBAL', 'country': 'ALL', 'topic': 'TRENDS',
+            'product': 'ALL', 'client_type': 'ALL', 'location': 'link10'
+        }
+    }
+]
+
+# -----------------------------
+# Setup / Utilities
+# -----------------------------
+
+def init_db(db_path: str = DB_PATH):
+    """Connect to LanceDB."""
+    return lancedb.connect(db_path)
+
+def init_model(name: str = EMBEDDING_MODEL_NAME):
+    """Load the sentence transformer model."""
+    return SentenceTransformer(name)
+
+def setup_database(db, table_name: str = TABLE_NAME, data: Optional[List[dict]] = None, model=None):
+    """Create table and load sample (or provided) data."""
+    if data is None:
+        data = text_chunks
+    if model is None:
+        model = init_model()
+
+    if table_name in db.table_names():
+        db.drop_table(table_name)
+
+    rows = []
+    for i, chunk in enumerate(data):
+        emb = model.encode(chunk['text'])
+        meta = chunk['metadata']
+        rows.append({
+            "id": i,
+            "text": chunk["text"],
+            "vector": emb,
+            "region": meta["region"],
+            "country": meta["country"],
+            "topic": meta["topic"],
+            "product": meta["product"],
+            "client_type": meta["client_type"],
+            "location": meta["location"],
+        })
+
+    df = pd.DataFrame(rows)
+    table = db.create_table(table_name, df)
+    print(f"✅ Created table '{table_name}' with {len(df)} documents")
+    return table
+
+def build_filter_string(filters: Dict[str, str]) -> Optional[str]:
+    """Build SQL-like filter string from a dict (ignores None/empty)."""
+    if not filters:
+        return None
+    parts = []
+    for k, v in filters.items():
+        if v is not None and str(v) != "":
+            parts.append(f"{k} = '{v}'")
+    return " AND ".join(parts) if parts else None
+
+def clean_filters(filters: Dict[str, str]) -> Dict[str, str]:
+    """Remove None/empty values from filters."""
+    return {k: v for k, v in filters.items() if v is not None and str(v) != ""}
+
+def execute_search(
+    table,
+    model,
+    query_text: str,
+    filters: Dict[str, str],
+    limit: int = MAX_RESULTS_DEFAULT
+) -> Tuple[pd.DataFrame, int]:
+    """Run a single semantic search with optional filters."""
+    emb = model.encode(query_text)
+    fstr = build_filter_string(filters)
+
+    if fstr:
+        df = table.search(emb).where(fstr).limit(limit).to_pandas()
+    else:
+        df = table.search(emb).limit(limit).to_pandas()
+
+    return df, len(df)
+
+# -----------------------------
+# Progressive Relaxation (functions)
+# -----------------------------
+
+def order_filters_by_priority(
+    active_filters: Dict[str, str],
+    priority_map: Dict[str, int] = FILTER_PRIORITY_DEFAULT
+) -> List[Tuple[str, str]]:
+    """Return [(key, value), ...] sorted ascending by priority (remove earlier first)."""
+    return sorted(active_filters.items(), key=lambda kv: priority_map.get(kv[0], 999))
+
+def progressive_search(
+    table,
+    model,
+    query_text: str,
+    initial_filters: Dict[str, str],
+    max_results: int = MAX_RESULTS_DEFAULT,
+    filter_priority: Dict[str, int] = FILTER_PRIORITY_DEFAULT,
+    verbose: bool = True
+) -> Dict:
+    """
+    Perform progressive filter relaxation until we get results (up to max_results),
+    removing filters in priority order.
+    """
+    start = time.time()
+    active_filters = clean_filters(initial_filters.copy())
+    removed: List[str] = []
+    iterations = 0
+
+    if verbose:
+        print("\n" + "="*60)
+        print("🔍 PROGRESSIVE FILTER SEARCH (functions-only)")
+        print("="*60)
+        print(f"Query: '{query_text}'")
+        print(f"Initial filters: {active_filters}")
+        print(f"Target results: Up to {max_results}")
+        print("-"*60)
+
+    # 1) Try with all filters
+    results, count = execute_search(table, model, query_text, active_filters, limit=max_results)
+    iterations += 1
+    if verbose:
+        print(f"\n📊 Iteration {iterations}: All filters applied")
+        print(f"   Active filters: {list(active_filters.keys()) or ['None']}")
+        print(f"   Results found: {count}")
+
+    # If we already have results (or exactly pure similarity with no filters), return
+    if count >= max_results or (count > 0 and len(active_filters) == 0):
+        if verbose:
+            print(f"\n✅ Search complete with {count} results")
+        return {
+            "results": results,
+            "applied_filters": active_filters,
+            "removed_filters": removed,
+            "search_iterations": iterations,
+            "execution_time": time.time() - start,
+        }
+
+    # 2) Relax in priority order
+    for key, _ in order_filters_by_priority(active_filters, filter_priority):
+        # remove one filter, then search again
+        active_filters.pop(key, None)
+        removed.append(key)
+        iterations += 1
+
+        results, count = execute_search(table, model, query_text, active_filters, limit=max_results)
+
+        if verbose:
+            print(f"\n📊 Iteration {iterations}: Removed '{key}'")
+            print(f"   Active filters: {list(active_filters.keys()) or ['None']}")
+            print(f"   Removed filters: {removed}")
+            print(f"   Results found: {count}")
+
+        if count >= max_results:
+            if verbose:
+                print(f"\n✅ Target reached! Found {count} results")
+            break
+
+        if not active_filters:
+            if verbose:
+                print(f"\n⚠️ All filters removed. Returning top {count} by similarity.")
+            break
+
+    exec_time = time.time() - start
+    if verbose:
+        print("\n" + "="*60)
+        print("📈 SEARCH SUMMARY")
+        print("="*60)
+        print(f"✓ Final result count: {count}")
+        print(f"✓ Filters applied: {active_filters or 'None (pure similarity search)'}")
+        print(f"✓ Filters removed: {removed or 'None'}")
+        print(f"✓ Iterations: {iterations}")
+        print(f"✓ Execution time: {exec_time:.3f}s")
+
+    return {
+        "results": results,
+        "applied_filters": active_filters,
+        "removed_filters": removed,
+        "search_iterations": iterations,
+        "execution_time": exec_time,
+    }
+
+def print_results(search_output: Dict, max_display: int = 5) -> None:
+    """Pretty-print top N results with key metadata."""
+    df: pd.DataFrame = search_output["results"]
+
+    print("\n" + "="*60)
+    print("📄 SEARCH RESULTS")
+    print("="*60)
+
+    if df.empty:
+        print("❌ No results found")
+        return
+
+    k = min(len(df), max_display)
+    print(f"Showing top {k} of {len(df)} results:\n")
+
+    # enumerate from 1 while iterating rows in order
+    for i, (_, row) in enumerate(df.head(k).iterrows(), start=1):
+        score = row.get("_distance", None)
+        score_str = f"{score:.4f}" if isinstance(score, float) else str(score)
+        print(f"Result {i}:")
+        print(f"  📍 Score: {score_str}")
+        print(f"  📝 Text: {row['text'][:100]}...")
+        print("  🏷️ Metadata:")
+        print(f"     - Region: {row['region']}")
+        print(f"     - Country: {row['country']}")
+        print(f"     - Topic: {row['topic']}")
+        print(f"     - Product: {row['product']}")
+        print(f"     - Client Type: {row['client_type']}")
+        print("-" * 40)
+
+# -----------------------------
+# Example usage (run directly)
+# -----------------------------
+if __name__ == "__main__":
+    # init
+    db = init_db(DB_PATH)
+    model = init_model(EMBEDDING_MODEL_NAME)
+
+    # create table with sample data
+    table = setup_database(db, TABLE_NAME, data=text_chunks, model=model)
+
+    # query + filters
+    query = "corporate cash payments in Singapore"
+    filters = {
+        "region": "ASIA",
+        "country": "SINGAPORE",
+        "topic": "S2B",
+        "product": "CASH",
+        "client_type": "CORPORATES",
+    }
+
+    # run progressive search
+    out = progressive_search(
+        table=table,
+        model=model,
+        query_text=query,
+        initial_filters=filters,
+        max_results=20,
+        filter_priority=FILTER_PRIORITY_DEFAULT,
+        verbose=True,
+    )
+
+    # pretty print
+    print_results(out, max_display=5)
+
+
+
