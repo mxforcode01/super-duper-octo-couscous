@@ -1,4 +1,73 @@
 def dump_into_lancedb(text_chunks, db_path, table_name):
+    db = lancedb.connect(db_path)
+    if table_name in db.table_names():
+        db.drop_table(table_name)
+
+    rows = []
+    for i, ch in enumerate(text_chunks):
+        rows.append({
+            "id": i,
+            "text": ch["text"],
+            "vector": encode_text(ch["text"], normalize=True),  # normalize on write
+            **ch["metadata"]
+        })
+    df = pd.DataFrame(rows)
+    tbl = db.create_table(table_name, df)
+
+    # Build an ANN index with cosine metric.
+    # If your dataset is small (<~100k), IVF_PQ is still fine; bump recall with nprobes later.
+    # If you prefer exact baseline first, comment this out and rely on flat scan while testing.
+    tbl.create_index(
+        column="vector",
+        index_type="ivf_pq",          # or "ivf_flat" / "hnsw" if available in your version
+        metric="cosine",
+        num_partitions=64,            # tune for your data size (e.g., ~sqrt(N))
+        num_sub_vectors=16            # PQ granularity; raise for better recall
+    )
+
+def lancedb_where_clause(filter_dict: dict | None) -> str | None:
+    if not filter_dict:
+        return None
+    parts = []
+    for k, v in filter_dict.items():
+        if v is None:
+            continue
+        # allow list-like values
+        if isinstance(v, (list, tuple, set)):
+            vv = [f"'{str(x).replace(\"'\", \"''\")}'" for x in v]
+            parts.append(f"{k} IN ({', '.join(vv)})")
+        else:
+            s = str(v).replace("'", "''")
+            parts.append(f"{k} = '{s}'")
+    return " AND ".join(parts) if parts else None
+
+def search_lancedb(query: str, table, top_k: int = 20, filter_dict: dict | None = None):
+    qtxt = make_query_text(query)
+    qvec = encode_text(qtxt, normalize=True)
+
+    # Build search
+    sq = table.search(qvec).metric("cosine")
+
+    # Prefilter BEFORE the ANN probe (closer to Qdrant’s integrated filter)
+    where = lancedb_where_clause(filter_dict)
+    if where:
+        sq = sq.where(where)  # LanceDB treats this as prefilter for the vector scan
+
+    # Overfetch similar to your Qdrant loop and refine
+    over_k = max(top_k * 3, top_k + 10)   # extra headroom
+    sq = sq.limit(over_k).refine_factor(3)   # re-rank a larger candidate set exactly
+
+    # Probe more partitions (higher recall; slower). Tune 8–32.
+    sq = sq.nprobes(16)
+
+    df = sq.to_pandas()
+
+    # Clip to final top_k (already ranked by distance)
+    return df.head(top_k)
+
+
+##########################################################
+def dump_into_lancedb(text_chunks, db_path, table_name):
     def prepare_data(chunks):
         """Convert text chunks to LanceDB format"""
         data = []
