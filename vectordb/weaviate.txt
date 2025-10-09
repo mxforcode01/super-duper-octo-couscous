@@ -1,0 +1,276 @@
+"""
+Weaviate Embedded Setup and Usage Script
+"""
+
+# 1. Install necessary packages
+# Run: pip install weaviate-client sentence-transformers
+
+import weaviate
+from weaviate.embedded import EmbeddedOptions
+from sentence_transformers import SentenceTransformer
+import os
+import json
+
+# Sample data
+text_chunks = [
+    {
+        'text': 'Countries that support ACH payment are Singapore, Malaysia. Countries that do not support are Vietnam, Myanmar, Bangladesh',
+        'metadata': {
+            'region': 'ASIA',
+            'country': 'ALL',
+            'topic': 'ACH',
+            'product': 'CASH',
+            'client_type': 'corporates',
+            'location': 'link'
+        }
+    },
+    {
+        'text': 'Countries that support RTGS payment are Singapore. Countries that do not support are Malaysia, Myanmar, Bangladesh',
+        'metadata': {
+            'region': 'ASIA',
+            'country': 'ALL',
+            'topic': 'RTGS',
+            'product': 'CASH',
+            'client_type': 'corporates',
+            'location': 'link'
+        }
+    }
+]
+
+# Initialize embedding model
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# 2. Set up database with embedded Weaviate
+db_path = "./weaviate_embedded_store"
+
+# Create embedded instance with persistence
+client = weaviate.Client(
+    embedded_options=EmbeddedOptions(
+        persistence_data_path=db_path,
+        binary_path=None,  # Will download automatically
+        port=8079,  # Use a specific port to avoid conflicts
+    ),
+    additional_headers={
+        "X-OpenAI-Api-Key": "not-needed-for-local"  # Placeholder, we're using local embeddings
+    }
+)
+
+print(f"✅ Weaviate Embedded client created. Data will be stored in: {db_path}")
+print(f"🔗 Client is ready: {client.is_ready()}")
+
+# 3. Create schema and add data
+class_name = "TextChunk"
+
+# Delete class if exists for fresh start
+try:
+    client.schema.delete_class(class_name)
+    print(f"🗑️  Deleted existing class '{class_name}'")
+except:
+    pass
+
+# Define schema with properties for metadata
+class_schema = {
+    "class": class_name,
+    "description": "Text chunks with metadata",
+    "vectorizer": "none",  # We'll provide our own vectors
+    "properties": [
+        {
+            "name": "text",
+            "dataType": ["text"],
+            "description": "The text content"
+        },
+        {
+            "name": "region",
+            "dataType": ["text"],
+            "description": "Region metadata"
+        },
+        {
+            "name": "country",
+            "dataType": ["text"],
+            "description": "Country metadata"
+        },
+        {
+            "name": "topic",
+            "dataType": ["text"],
+            "description": "Topic metadata"
+        },
+        {
+            "name": "product",
+            "dataType": ["text"],
+            "description": "Product metadata"
+        },
+        {
+            "name": "client_type",
+            "dataType": ["text"],
+            "description": "Client type metadata"
+        },
+        {
+            "name": "location",
+            "dataType": ["text"],
+            "description": "Location metadata"
+        }
+    ]
+}
+
+# Create the class
+client.schema.create_class(class_schema)
+print(f"📋 Created schema for class '{class_name}'")
+
+# Add documents with vectors
+with client.batch as batch:
+    batch.batch_size = 100
+    
+    for i, chunk in enumerate(text_chunks):
+        # Generate embedding
+        embedding = model.encode(chunk['text']).tolist()
+        
+        # Prepare properties
+        properties = {
+            "text": chunk['text'],
+            **chunk['metadata']  # Add all metadata fields
+        }
+        
+        # Add to batch
+        batch.add_data_object(
+            data_object=properties,
+            class_name=class_name,
+            vector=embedding
+        )
+
+print(f"📊 Added {len(text_chunks)} chunks to class '{class_name}'")
+
+# Verify data was added
+result = client.query.aggregate(class_name).with_meta_count().do()
+count = result['data']['Aggregate'][class_name][0]['meta']['count']
+print(f"📝 Total objects in database: {count}")
+
+# 4. Store is automatic - Weaviate persists to disk
+
+# 5. Access database from local directory (simulated reconnection)
+# In practice, you would stop and restart the client
+print(f"\n📂 Database persisted to: {db_path}")
+print("ℹ️  Note: Weaviate Embedded maintains persistence automatically")
+
+# 6. Search via sample query
+def search(query, client, class_name, limit=3, where_filter=None):
+    """Search for similar text with optional filtering"""
+    # Generate query embedding
+    query_embedding = model.encode(query).tolist()
+    
+    # Build query
+    query_builder = (
+        client.query
+        .get(class_name, ["text", "region", "country", "topic", "product", "client_type", "location"])
+        .with_near_vector({
+            "vector": query_embedding,
+            "certainty": 0.7  # Similarity threshold
+        })
+        .with_limit(limit)
+        .with_additional(["certainty", "id"])
+    )
+    
+    # Add where filter if provided
+    if where_filter:
+        query_builder = query_builder.with_where(where_filter)
+    
+    # Execute query
+    result = query_builder.do()
+    
+    return result
+
+# Example searches
+print("\n🔍 Search Examples:")
+print("-" * 50)
+
+# Search 1: Basic semantic search
+query1 = "Which countries support ACH payment?"
+results1 = search(query1, client, class_name, limit=2)
+print(f"\nQuery: {query1}")
+if 'data' in results1 and 'Get' in results1['data']:
+    for obj in results1['data']['Get'][class_name]:
+        print(f"  - Certainty: {obj['_additional']['certainty']:.4f}")
+        print(f"    Text: {obj['text'][:100]}...")
+        print(f"    Topic: {obj['topic']}, Region: {obj['region']}")
+        print(f"    ID: {obj['_additional']['id']}")
+
+# Search 2: With metadata filtering
+query2 = "payment systems"
+where_filter = {
+    "path": ["topic"],
+    "operator": "Equal",
+    "valueText": "RTGS"
+}
+results2 = search(query2, client, class_name, limit=2, where_filter=where_filter)
+print(f"\nQuery: {query2} (filtered by topic='RTGS')")
+if 'data' in results2 and 'Get' in results2['data']:
+    for obj in results2['data']['Get'][class_name]:
+        print(f"  - Certainty: {obj['_additional']['certainty']:.4f}")
+        print(f"    Text: {obj['text'][:100]}...")
+        print(f"    Topic: {obj['topic']}")
+
+# Search 3: Complex filtering (AND condition)
+query3 = "countries"
+complex_filter = {
+    "operator": "And",
+    "operands": [
+        {
+            "path": ["region"],
+            "operator": "Equal",
+            "valueText": "ASIA"
+        },
+        {
+            "path": ["product"],
+            "operator": "Equal",
+            "valueText": "CASH"
+        }
+    ]
+}
+results3 = search(query3, client, class_name, limit=2, where_filter=complex_filter)
+print(f"\nQuery: {query3} (filtered by region='ASIA' AND product='CASH')")
+if 'data' in results3 and 'Get' in results3['data']:
+    for obj in results3['data']['Get'][class_name]:
+        print(f"  - Text: {obj['text'][:100]}...")
+        print(f"    Region: {obj['region']}, Product: {obj['product']}")
+
+# Search 4: Text content search using BM25
+query4 = "Singapore"
+bm25_results = (
+    client.query
+    .get(class_name, ["text", "topic", "region"])
+    .with_bm25(query=query4)
+    .with_limit(2)
+    .with_additional(["score"])
+    .do()
+)
+print(f"\nQuery: BM25 search for '{query4}'")
+if 'data' in bm25_results and 'Get' in bm25_results['data']:
+    for obj in bm25_results['data']['Get'][class_name]:
+        print(f"  - Score: {obj['_additional']['score']}")
+        print(f"    Text: {obj['text'][:100]}...")
+
+# Additional operations
+print("\n📊 Additional Operations:")
+
+# Get all objects
+all_objects = (
+    client.query
+    .get(class_name, ["text"])
+    .with_limit(100)
+    .do()
+)
+if 'data' in all_objects and 'Get' in all_objects['data']:
+    print(f"Total objects retrieved: {len(all_objects['data']['Get'][class_name])}")
+
+# Get object by ID (if you have one from previous searches)
+if 'data' in results1 and 'Get' in results1['data'] and len(results1['data']['Get'][class_name]) > 0:
+    first_id = results1['data']['Get'][class_name][0]['_additional']['id']
+    specific_object = client.data_object.get_by_id(first_id, class_name=class_name)
+    print(f"Retrieved object by ID: {specific_object['properties']['text'][:50]}...")
+
+print("\n✅ Weaviate Embedded setup complete!")
+print(f"📁 Data persisted in: {db_path}")
+print("ℹ️  To stop the embedded instance, use: client._connection.close()")
+
+# Clean shutdown
+client._connection.close()
+print("🔌 Weaviate Embedded instance closed")
