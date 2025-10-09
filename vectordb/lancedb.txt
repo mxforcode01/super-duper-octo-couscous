@@ -1,0 +1,145 @@
+"""
+LanceDB Setup and Usage Script
+"""
+
+# 1. Install necessary packages
+# Run: pip install lancedb sentence-transformers
+
+import lancedb
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import os
+
+# Sample data
+text_chunks = [
+    {
+        'text': 'Countries that support ACH payment are Singapore, Malaysia. Countries that do not support are Vietnam, Myanmar, Bangladesh',
+        'metadata': {
+            'region': 'ASIA',
+            'country': 'ALL',
+            'topic': 'ACH',
+            'product': 'CASH',
+            'client_type': 'corporates',
+            'location': 'link'
+        }
+    },
+    {
+        'text': 'Countries that support RTGS payment are Singapore. Countries that do not support are Malaysia, Myanmar, Bangladesh',
+        'metadata': {
+            'region': 'ASIA',
+            'country': 'ALL',
+            'topic': 'RTGS',
+            'product': 'CASH',
+            'client_type': 'corporates',
+            'location': 'link'
+        }
+    }
+]
+
+# Initialize embedding model
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# 2. Set up database
+db_path = "./lancedb_store"
+db = lancedb.connect(db_path)
+
+# 3. Prepare and dump text chunks into database
+def prepare_data(chunks):
+    """Convert text chunks to LanceDB format"""
+    data = []
+    for i, chunk in enumerate(chunks):
+        # Generate embedding
+        embedding = model.encode(chunk['text'])
+        
+        # Create record with text, embedding, and metadata
+        record = {
+            'id': i,
+            'text': chunk['text'],
+            'vector': embedding,
+            **chunk['metadata']  # Flatten metadata into columns
+        }
+        data.append(record)
+    
+    return data
+
+# Create table and add data
+table_name = "text_chunks"
+
+# Drop table if exists for fresh start
+if table_name in db.table_names():
+    db.drop_table(table_name)
+
+# Prepare data and create table
+data = prepare_data(text_chunks)
+df = pd.DataFrame(data)
+table = db.create_table(table_name, df)
+
+print(f"✅ LanceDB setup complete. Data stored in: {db_path}")
+print(f"📊 Added {len(data)} chunks to table '{table_name}'")
+
+# 4. Store is automatic - LanceDB saves to disk immediately
+
+# 5. Access database from local directory
+# Reconnect to demonstrate persistence
+db = lancedb.connect(db_path)
+table = db.open_table(table_name)
+
+print(f"\n📂 Reconnected to database from: {db_path}")
+print(f"📋 Available tables: {db.table_names()}")
+print(f"📝 Number of records: {table.count_rows()}")
+
+# 6. Search via sample query
+def search(query, table, top_k=3, filter_dict=None):
+    """Search for similar text with optional metadata filtering"""
+    # Generate query embedding
+    query_embedding = model.encode(query)
+    
+    # Build search query
+    search_query = table.search(query_embedding).limit(top_k)
+    
+    # Apply metadata filters if provided
+    if filter_dict:
+        filter_string = " AND ".join([f"{k} = '{v}'" for k, v in filter_dict.items()])
+        search_query = search_query.where(filter_string)
+    
+    # Execute search
+    results = search_query.to_pandas()
+    
+    return results
+
+# Example searches
+print("\n🔍 Search Examples:")
+print("-" * 50)
+
+# Search 1: Basic semantic search
+query1 = "Which countries support ACH payment?"
+results1 = search(query1, table, top_k=2)
+print(f"\nQuery: {query1}")
+for idx, row in results1.iterrows():
+    print(f"  - Score: {row['_distance']:.4f}")
+    print(f"    Text: {row['text'][:100]}...")
+    print(f"    Topic: {row['topic']}, Region: {row['region']}")
+
+# Search 2: With metadata filtering
+query2 = "payment systems"
+filter_criteria = {'topic': 'RTGS'}
+results2 = search(query2, table, top_k=2, filter_dict=filter_criteria)
+print(f"\nQuery: {query2} (filtered by topic='RTGS')")
+for idx, row in results2.iterrows():
+    print(f"  - Score: {row['_distance']:.4f}")
+    print(f"    Text: {row['text'][:100]}...")
+    print(f"    Topic: {row['topic']}")
+
+# Additional useful operations
+print("\n📊 Additional Operations:")
+print(f"Total rows: {table.count_rows()}")
+print(f"Schema: {table.schema}")
+
+# Query all records with specific metadata
+asia_cash_records = table.to_pandas()
+asia_cash_records = asia_cash_records[
+    (asia_cash_records['region'] == 'ASIA') & 
+    (asia_cash_records['product'] == 'CASH')
+]
+print(f"Records for ASIA region with CASH product: {len(asia_cash_records)}")
