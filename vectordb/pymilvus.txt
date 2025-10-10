@@ -1,0 +1,154 @@
+# pip install "pymilvus>=2.4.2"
+from pymilvus import (
+    MilvusClient, DataType, FieldSchema, CollectionSchema, IndexParams
+)
+import numpy as np
+
+# --------- CONFIG ---------
+URI = "./milvus_demo.db"   # local file-based Milvus-lite
+COLL = "rag_chunks_demo"
+DIM = 384                  # set to your embedding size
+
+# Dummy encoder for demo; replace with your actual embedding function
+def encode(text: str) -> np.ndarray:
+    v = np.random.randn(DIM).astype("float32")
+    v /= (np.linalg.norm(v) + 1e-12)  # normalize for cosine-like IP
+    return v
+
+# --------- SAMPLE INPUT (your shape) ---------
+input_data = [
+    {
+        "text": "s2b payment capability....",
+        "metadata": {
+            "region": "ALL",
+            "country": "ALL",
+            "client_type": "CORPORATES",
+            "product": "CASH",
+            "topic": "S2B",
+            "location": "link",
+            "updated_date": "2025-01-01",
+            "year": 2025
+        }
+    },
+    {
+        "text": "s2b collection capability....",
+        "metadata": {
+            "region": "ALL",
+            "country": "ALL",
+            "client_type": "CORPORATES",
+            "product": "CASH",
+            "topic": "S2B",
+            "location": "link",
+            "updated_date": "2025-01-01",
+            "year": 2025
+        }
+    }
+]
+
+# --------- CONNECT ---------
+client = MilvusClient(uri=URI)
+
+# --------- SCHEMA ---------
+fields = [
+    # Auto primary key so you don't need to supply IDs
+    FieldSchema(name="pk", dtype=DataType.INT64, is_primary=True, auto_id=True),
+
+    # Content
+    FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=4096),
+
+    # Metadata (strings)
+    FieldSchema(name="region", dtype=DataType.VARCHAR, max_length=32),
+    FieldSchema(name="country", dtype=DataType.VARCHAR, max_length=64),
+    FieldSchema(name="client_type", dtype=DataType.VARCHAR, max_length=64),
+    FieldSchema(name="product", dtype=DataType.VARCHAR, max_length=64),
+    FieldSchema(name="topic", dtype=DataType.VARCHAR, max_length=64),
+    FieldSchema(name="location", dtype=DataType.VARCHAR, max_length=512),
+    FieldSchema(name="updated_date", dtype=DataType.VARCHAR, max_length=32),  # store ISO date as string
+
+    # Metadata (numeric)
+    FieldSchema(name="year", dtype=DataType.INT64),
+
+    # Embedding
+    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=DIM),
+]
+schema = CollectionSchema(fields, description="RAG chunks with metadata")
+
+# Recreate collection for a clean run (optional)
+if COLL in client.list_collections():
+    client.drop_collection(COLL)
+
+# Index: FLAT is safe everywhere (Lite). Use IP since vectors are normalized
+index_params = IndexParams().add_index(
+    field_name="embedding", index_type="FLAT", metric_type="IP"
+)
+client.create_collection(
+    collection_name=COLL,
+    schema=schema,
+    index_params=index_params
+)
+
+# --------- TRANSFORM + INSERT ---------
+rows = []
+for item in input_data:
+    meta = item["metadata"]
+    rows.append({
+        "text": item["text"],
+        "region": meta.get("region", "ALL"),
+        "country": meta.get("country", "ALL"),
+        "client_type": meta.get("client_type", ""),
+        "product": meta.get("product", ""),
+        "topic": meta.get("topic", ""),
+        "location": meta.get("location", ""),
+        "updated_date": meta.get("updated_date", ""),
+        "year": int(meta.get("year", 0)),
+        "embedding": encode(item["text"]).tolist(),
+    })
+
+client.upsert(collection_name=COLL, data=rows)
+client.flush(COLL)
+
+# --------- HYBRID SEARCH EXAMPLES ---------
+# 1) Strict AND filter (exact matches)
+query_vec = encode("corporate cash management in Singapore").tolist()
+strict_expr = "client_type == 'CORPORATES' and product == 'CASH' and topic == 'S2B'"
+hits = client.search(
+    collection_name=COLL,
+    data=[query_vec],
+    anns_field="embedding",
+    limit=5,
+    search_params={"metric_type": "IP"},
+    filter=strict_expr,
+    output_fields=["text", "region", "country", "client_type", "product", "topic", "year", "updated_date", "location"]
+)
+print("\nStrict AND filter results:")
+for h in hits[0]:
+    e = h["entity"]
+    print(f"score={h['distance']:.4f} | text={e['text']} | country={e['country']} | product={e['product']}")
+
+# 2) Handling your 'ALL' convention
+#    Example: treat a doc as matching if its country is 'ALL' OR specifically 'SINGAPORE'
+#    (Same pattern applies to region == 'ALL' OR region == 'ASIA', etc.)
+expr_all_country = "(country == 'ALL' or country == 'SINGAPORE') and topic == 'S2B' and product == 'CASH'"
+hits_all = client.search(
+    collection_name=COLL,
+    data=[query_vec],
+    anns_field="embedding",
+    limit=5,
+    search_params={"metric_type": "IP"},
+    filter=expr_all_country,
+    output_fields=["text", "country", "region", "product", "topic"]
+)
+print("\nALL-aware filter results:")
+for h in hits_all[0]:
+    e = h["entity"]
+    print(f"score={h['distance']:.4f} | text={e['text']} | country={e['country']} | region={e['region']}")
+
+# 3) Pure scalar query (no vector), with AND + IN + numeric filter
+rows_scalar = client.query(
+    collection_name=COLL,
+    filter="client_type == 'CORPORATES' and topic in ['S2B', 'TREASURY'] and year >= 2025",
+    output_fields=["pk", "text", "year", "updated_date", "country"]
+)
+print("\nScalar-only query results:")
+for r in rows_scalar:
+    print(r)
