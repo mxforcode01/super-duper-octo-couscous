@@ -145,22 +145,92 @@ def search_qdrant(query, client, collection_name="my_docs_bge", top_k=20, stages
 
 ##############################################################################################
 
-import time
-from typing import Dict, Optional, Tuple, List
+import numpy as np
 
-import lancedb
-import pandas as pd
-from sentence_transformers import SentenceTransformer
+def make_query_text(q: str) -> str:
+    # mirror your Qdrant search that used: "query: " + query
+    return "query: " + str(q)
 
-# -----------------------------
-# Config
-# -----------------------------
-DB_PATH = "./lancedb_progressive"
-TABLE_NAME = "text_chunks"
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-MAX_RESULTS_DEFAULT = 20
+def encode_query(model, text: str, normalize: bool = True):
+    v = model.encode(text)
+    if normalize:
+        n = np.linalg.norm(v)
+        if n > 0:
+            v = v / n
+    return v
 
-# First-removed -> last-removed (lower number = remove earlier)
+def drop_all_values(filters: Dict[str, str]) -> Dict[str, str]:
+    """Remove filter keys whose value equals 'ALL' (case-insensitive)."""
+    out = {}
+    for k, v in (filters or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip().upper() == "ALL":
+            continue
+        out[k] = v
+    return out
+
+def build_filter_string(filters: Dict[str, object]) -> Optional[str]:
+    """
+    Build a SQL-like WHERE for LanceDB. Supports scalars and lists.
+    - Escapes single quotes
+    - Skips None/empty
+    """
+    if not filters:
+        return None
+    parts = []
+    for k, v in filters.items():
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            continue
+        if isinstance(v, (list, tuple, set)):
+            vals = [f"'{str(x).replace(\"'\", \"''\")}'" for x in v if x is not None and str(x) != ""]
+            if vals:
+                parts.append(f"{k} IN ({', '.join(vals)})")
+        else:
+            s = str(v).replace("'", "''")
+            parts.append(f"{k} = '{s}'")
+    return " AND ".join(parts) if parts else None
+
+def execute_search(
+    table,
+    model,
+    query_text: str,
+    filters: Dict[str, object],
+    limit: int = 20,
+    overfetch_mult: int = 3,
+    refine_factor: int = 3,
+    nprobes: int = 16,
+) -> Tuple[pd.DataFrame, int]:
+    """
+    Qdrant-like LanceDB search:
+    - cosine metric
+    - normalized query vector
+    - prefilter via .where(...)
+    - overfetch + refine + nprobes to raise recall
+    """
+    qtxt = make_query_text(query_text)
+    qvec = encode_query(model, qtxt, normalize=True)
+
+    # Drop any 'ALL' values to match your usual semantics
+    filters = drop_all_values(filters)
+    fstr = build_filter_string(filters)
+
+    # Overfetch similar to your Qdrant loop (need * 3)
+    over_k = max(limit * overfetch_mult, limit + 10)
+
+    sq = table.search(qvec).metric("cosine")
+    if fstr:
+        sq = sq.where(fstr)           # PREFILTER: affect the candidate set
+    sq = sq.nprobes(nprobes)          # probe more partitions (higher recall)
+    sq = sq.refine_factor(refine_factor)  # re-rank a larger candidate set exactly
+    sq = sq.limit(over_k)             # over-fetch then clip
+
+    df = sq.to_pandas()
+    # NOTE: LanceDB returns already sorted results (by distance/score).
+    # Clip to requested limit:
+    df = df.head(limit)
+    return df, len(df)
+
 FILTER_PRIORITY_DEFAULT = {
     "topic": 1,
     "product": 2,
@@ -169,48 +239,13 @@ FILTER_PRIORITY_DEFAULT = {
     "country": 5,
 }
 
-
-def build_filter_string(filters: Dict[str, str]) -> Optional[str]:
-    """Build SQL-like filter string from a dict (ignores None/empty)."""
-    if not filters:
-        return None
-    parts = []
-    for k, v in filters.items():
-        if v is not None and str(v) != "":
-            parts.append(f"{k} = '{v}'")
-    return " AND ".join(parts) if parts else None
-
 def clean_filters(filters: Dict[str, str]) -> Dict[str, str]:
-    """Remove None/empty values from filters."""
-    return {k: v for k, v in filters.items() if v is not None and str(v) != ""}
-
-def execute_search(
-    table,
-    model,
-    query_text: str,
-    filters: Dict[str, str],
-    limit: int = MAX_RESULTS_DEFAULT
-) -> Tuple[pd.DataFrame, int]:
-    """Run a single semantic search with optional filters."""
-    emb = model.encode(query_text)
-    fstr = build_filter_string(filters)
-
-    if fstr:
-        df = table.search(emb).where(fstr).limit(limit).to_pandas()
-    else:
-        df = table.search(emb).limit(limit).to_pandas()
-
-    return df, len(df)
-
-# -----------------------------
-# Progressive Relaxation (functions)
-# -----------------------------
+    return {k: v for k, v in (filters or {}).items() if v is not None and str(v) != ""}
 
 def order_filters_by_priority(
     active_filters: Dict[str, str],
     priority_map: Dict[str, int] = FILTER_PRIORITY_DEFAULT
 ) -> List[Tuple[str, str]]:
-    """Return [(key, value), ...] sorted ascending by priority (remove earlier first)."""
     return sorted(active_filters.items(), key=lambda kv: priority_map.get(kv[0], 999))
 
 def progressive_search(
@@ -218,81 +253,26 @@ def progressive_search(
     model,
     query_text: str,
     initial_filters: Dict[str, str],
-    max_results: int = MAX_RESULTS_DEFAULT,
+    max_results: int = 20,
     filter_priority: Dict[str, int] = FILTER_PRIORITY_DEFAULT,
     verbose: bool = True
-) -> Dict:
-    """
-    Perform progressive filter relaxation until we get results (up to max_results),
-    removing filters in priority order.
-    """
-    active_filters = clean_filters(initial_filters.copy())
-    removed: List[str] = []
+) -> pd.DataFrame:
+    active_filters = drop_all_values(clean_filters(initial_filters.copy()))
     iterations = 0
 
     # 1) Try with all filters
-    results, count = execute_search(table, model, query_text, active_filters, limit=max_results)
+    df, count = execute_search(table, model, query_text, active_filters, limit=max_results)
     iterations += 1
-
-    # If we already have results (or exactly pure similarity with no filters), return
     if count >= max_results or (count > 0 and len(active_filters) == 0):
-        return results
-    # 2) Relax in priority order
+        return df
+
+    # 2) Relax in priority order (topic → product → client_type → region → country)
     for key, _ in order_filters_by_priority(active_filters, filter_priority):
-        # remove one filter, then search again
         active_filters.pop(key, None)
-        removed.append(key)
         iterations += 1
-
-        results, count = execute_search(table, model, query_text, active_filters, limit=max_results)
-
-        if count >= max_results:
+        df, count = execute_search(table, model, query_text, active_filters, limit=max_results)
+        if count >= max_results or not active_filters:
             break
 
-        if not active_filters:
-            break
+    return df
 
-    return results
-
-def prettify(df):
-    results = []
-    for _, row in df.iterrows():
-        entry = {
-            'text':row['text'],
-            'metadata': {
-                'region':row['region'],
-                'country':row['country'],
-                'client_type':row['client_type'],
-                'product':row['product'],
-                'topic':row['topic'],
-                'location':row['location'],
-                'filename':row['filename'],
-                'updated_date':row['updated_date'],
-                'year':row['year'],
-            }
-        }
-        results.append(entry)
-    return results
-
-# -----------------------------
-# Example usage (run directly)
-# -----------------------------
-if __name__ == "__main__":
-
-    # query + filters
-    query = "price of bangladesh"
-    filters = {}
-
-    # run progressive search
-    results = progressive_search(
-        table=tbl,
-        model=model,
-        query_text=query,
-        initial_filters=filters,
-        max_results=20,
-        filter_priority=FILTER_PRIORITY_DEFAULT,
-        verbose=True,
-    )
-    # results = prettify(results)
-    # pretty print
-    results
