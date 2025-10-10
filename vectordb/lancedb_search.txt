@@ -142,3 +142,157 @@ def search_qdrant(query, client, collection_name="my_docs_bge", top_k=20, stages
                 if len(results) >= top_k:
                     break
     return results
+
+##############################################################################################
+
+import time
+from typing import Dict, Optional, Tuple, List
+
+import lancedb
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+
+# -----------------------------
+# Config
+# -----------------------------
+DB_PATH = "./lancedb_progressive"
+TABLE_NAME = "text_chunks"
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+MAX_RESULTS_DEFAULT = 20
+
+# First-removed -> last-removed (lower number = remove earlier)
+FILTER_PRIORITY_DEFAULT = {
+    "topic": 1,
+    "product": 2,
+    "client_type": 3,
+    "region": 4,
+    "country": 5,
+}
+
+
+def build_filter_string(filters: Dict[str, str]) -> Optional[str]:
+    """Build SQL-like filter string from a dict (ignores None/empty)."""
+    if not filters:
+        return None
+    parts = []
+    for k, v in filters.items():
+        if v is not None and str(v) != "":
+            parts.append(f"{k} = '{v}'")
+    return " AND ".join(parts) if parts else None
+
+def clean_filters(filters: Dict[str, str]) -> Dict[str, str]:
+    """Remove None/empty values from filters."""
+    return {k: v for k, v in filters.items() if v is not None and str(v) != ""}
+
+def execute_search(
+    table,
+    model,
+    query_text: str,
+    filters: Dict[str, str],
+    limit: int = MAX_RESULTS_DEFAULT
+) -> Tuple[pd.DataFrame, int]:
+    """Run a single semantic search with optional filters."""
+    emb = model.encode(query_text)
+    fstr = build_filter_string(filters)
+
+    if fstr:
+        df = table.search(emb).where(fstr).limit(limit).to_pandas()
+    else:
+        df = table.search(emb).limit(limit).to_pandas()
+
+    return df, len(df)
+
+# -----------------------------
+# Progressive Relaxation (functions)
+# -----------------------------
+
+def order_filters_by_priority(
+    active_filters: Dict[str, str],
+    priority_map: Dict[str, int] = FILTER_PRIORITY_DEFAULT
+) -> List[Tuple[str, str]]:
+    """Return [(key, value), ...] sorted ascending by priority (remove earlier first)."""
+    return sorted(active_filters.items(), key=lambda kv: priority_map.get(kv[0], 999))
+
+def progressive_search(
+    table,
+    model,
+    query_text: str,
+    initial_filters: Dict[str, str],
+    max_results: int = MAX_RESULTS_DEFAULT,
+    filter_priority: Dict[str, int] = FILTER_PRIORITY_DEFAULT,
+    verbose: bool = True
+) -> Dict:
+    """
+    Perform progressive filter relaxation until we get results (up to max_results),
+    removing filters in priority order.
+    """
+    active_filters = clean_filters(initial_filters.copy())
+    removed: List[str] = []
+    iterations = 0
+
+    # 1) Try with all filters
+    results, count = execute_search(table, model, query_text, active_filters, limit=max_results)
+    iterations += 1
+
+    # If we already have results (or exactly pure similarity with no filters), return
+    if count >= max_results or (count > 0 and len(active_filters) == 0):
+        return results
+    # 2) Relax in priority order
+    for key, _ in order_filters_by_priority(active_filters, filter_priority):
+        # remove one filter, then search again
+        active_filters.pop(key, None)
+        removed.append(key)
+        iterations += 1
+
+        results, count = execute_search(table, model, query_text, active_filters, limit=max_results)
+
+        if count >= max_results:
+            break
+
+        if not active_filters:
+            break
+
+    return results
+
+def prettify(df):
+    results = []
+    for _, row in df.iterrows():
+        entry = {
+            'text':row['text'],
+            'metadata': {
+                'region':row['region'],
+                'country':row['country'],
+                'client_type':row['client_type'],
+                'product':row['product'],
+                'topic':row['topic'],
+                'location':row['location'],
+                'filename':row['filename'],
+                'updated_date':row['updated_date'],
+                'year':row['year'],
+            }
+        }
+        results.append(entry)
+    return results
+
+# -----------------------------
+# Example usage (run directly)
+# -----------------------------
+if __name__ == "__main__":
+
+    # query + filters
+    query = "price of bangladesh"
+    filters = {}
+
+    # run progressive search
+    results = progressive_search(
+        table=tbl,
+        model=model,
+        query_text=query,
+        initial_filters=filters,
+        max_results=20,
+        filter_priority=FILTER_PRIORITY_DEFAULT,
+        verbose=True,
+    )
+    # results = prettify(results)
+    # pretty print
+    results
