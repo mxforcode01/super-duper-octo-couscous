@@ -1,6 +1,6 @@
 """
-Integrated Semantic-First Progressive Filter System
-Combines metadata extraction with query intent analysis
+Corrected Semantic-First Progressive Filter System
+Respects extracted metadata filters and only adjusts for negations
 """
 
 import lancedb
@@ -126,7 +126,6 @@ def map_question_to_client_type(question):
     q_upper = question.upper()
     client_types = ['ALL', 'CORPORATES', 'FI', 'FINANCIAL INSTITUTION', 'PAYTECH', 'RETAIL', 'INSTITUTIONAL']
     
-    # Map variations to standard terms
     client_map = {
         'FINANCIAL INSTITUTION': 'FI',
         'FI': 'FI',
@@ -144,11 +143,9 @@ def map_question_to_client_type(question):
     return list(found)
 
 def map_question_to_topic(question):
-    """Extended to include more topics beyond S2B"""
     found = set()
     q_upper = question.upper()
     
-    # Topic variations and their standard forms
     topic_patterns = {
         'S2B': ['S2B', 'STRAIGHT2BANK', 'STRAIGHT 2 BANK'],
         'ACH': ['ACH', 'AUTOMATED CLEARING HOUSE'],
@@ -170,178 +167,277 @@ def map_question_to_topic(question):
     return list(found)
 
 def process_question(session_id: str, question: str):
-    """Extract metadata filters from question"""
+    """
+    Extract metadata filters from question
+    CORRECTED: No query augmentation, respect extracted filters as final
+    """
     fd = get_filter_dict(session_id)
     
+    # Extract direct mentions
     extracted_countries = map_question_to_countries(question)
     extracted_region = map_question_to_region(question)
-    extracted_indirect_countries = map_unofficialregion_to_countries(question)
     extracted_products = map_question_to_product(question)
     extracted_client_types = map_question_to_client_type(question)
     extracted_topics = map_question_to_topic(question)
     
-    # If both region and countries are extracted, skip indirect countries
-    if extracted_region and extracted_countries:
-        extracted_indirect_countries = []
+    # Handle regional expansions ONLY if no specific countries are mentioned
+    extracted_indirect_countries = []
+    if not extracted_countries:  # Only expand regions if no specific countries
+        extracted_indirect_countries = map_unofficialregion_to_countries(question)
     
-    # Augment question with indirect countries for better semantic search
-    if extracted_indirect_countries:
-        question += ", " + ", ".join(extracted_indirect_countries)
+    # Combine countries (but only if needed)
+    parsed_country = extracted_countries if extracted_countries else extracted_indirect_countries
     
-    # Combine all countries
-    parsed_country = list(set(extracted_countries + extracted_indirect_countries))
+    # Update filter dictionary with ONLY what was found
+    if parsed_country:
+        extend_unique(fd, "country", parsed_country)
+    if extracted_region:
+        extend_unique(fd, "region", extracted_region)
+    if extracted_products:
+        extend_unique(fd, "product", extracted_products)
+    if extracted_client_types:
+        extend_unique(fd, "client_type", extracted_client_types)
+    if extracted_topics:
+        extend_unique(fd, "topic", extracted_topics)
     
-    # Update filter dictionary
-    extend_unique(fd, "country", parsed_country)
-    extend_unique(fd, "region", extracted_region)
-    extend_unique(fd, "product", extracted_products)
-    extend_unique(fd, "client_type", extracted_client_types)
-    extend_unique(fd, "topic", extracted_topics)
-    
+    # DON'T augment the query - keep it original
     return fd, question
 
 # ========================================
-# ENHANCED QUERY INTENT ANALYZER
+# QUERY NEGATION ANALYZER
 # ========================================
 
-class EnhancedQueryIntentAnalyzer:
+class NegationAnalyzer:
     """
-    Analyzes query intent for negations and contradictions
-    Integrates with metadata extraction
+    Analyzes query for negations and exclusions
     """
     
     def __init__(self):
-        # Negative patterns
+        # Patterns for detecting negations
         self.negative_patterns = [
-            r'without\s+(\w+)',
-            r'exclude\s+(\w+)',
-            r'excluding\s+(\w+)',
-            r'except\s+(\w+)',
-            r'not\s+(?:in\s+)?(\w+)',
-            r'no\s+(\w+)',
-            r'avoid\s+(\w+)',
-            r'skip\s+(\w+)',
-            r'minus\s+(\w+)',
-            r'remove\s+(\w+)',
-            r'omit\s+(\w+)',
-        ]
-        
-        # Multi-word negative patterns
-        self.multi_word_negative_patterns = [
-            r'without\s+([\w\s]+?)(?:\.|,|;|$)',
-            r'excluding\s+([\w\s]+?)(?:\.|,|;|$)',
-            r'except\s+(?:for\s+)?([\w\s]+?)(?:\.|,|;|$)',
+            (r'without\s+([\w\s,]+?)(?:\s+for|\s+in|\.|,|;|$)', 'without'),
+            (r'exclude\s+([\w\s,]+?)(?:\s+from|\.|,|;|$)', 'exclude'),
+            (r'excluding\s+([\w\s,]+?)(?:\s+from|\.|,|;|$)', 'excluding'),
+            (r'except\s+(?:for\s+)?([\w\s,]+?)(?:\.|,|;|$)', 'except'),
+            (r'not\s+(?:in\s+)?([\w\s,]+?)(?:\.|,|;|$)', 'not'),
+            (r'no\s+([\w\s,]+?)(?:\s+support|\s+service|\.|,|;|$)', 'no'),
+            (r'avoid\s+([\w\s,]+?)(?:\.|,|;|$)', 'avoid'),
+            (r'omit\s+([\w\s,]+?)(?:\.|,|;|$)', 'omit'),
         ]
     
-    def extract_negations_enhanced(self, question: str) -> Dict[str, Set[str]]:
+    def extract_negations(self, query: str) -> Dict[str, Set[str]]:
         """
-        Extract negations using both simple and complex patterns
+        Extract negated entities from query
         Returns categorized negations
         """
-        q_lower = question.lower()
+        q_lower = query.lower()
         negations = {
             'countries': set(),
             'regions': set(),
             'products': set(),
             'topics': set(),
-            'client_types': set(),
-            'general': set()
+            'client_types': set()
         }
         
-        # Extract using simple patterns
-        for pattern in self.negative_patterns:
+        for pattern, neg_type in self.negative_patterns:
             matches = re.findall(pattern, q_lower)
             for match in matches:
-                categorized = self._categorize_term(match)
-                for category, terms in categorized.items():
-                    negations[category].update(terms)
+                # Parse the matched string for entities
+                entities = self._parse_entities(match)
+                for category, items in entities.items():
+                    negations[category].update(items)
         
-        # Extract using multi-word patterns
-        for pattern in self.multi_word_negative_patterns:
-            matches = re.findall(pattern, q_lower)
-            for match in matches:
-                # Split multi-word matches and categorize each
-                words = match.strip().split()
-                for word in words:
-                    categorized = self._categorize_term(word)
-                    for category, terms in categorized.items():
-                        negations[category].update(terms)
-        
-        # Convert sets to lists
-        return {k: list(v) for k, v in negations.items()}
+        return {k: list(v) for k, v in negations.items() if v}
     
-    def _categorize_term(self, term: str) -> Dict[str, Set[str]]:
-        """Categorize a term into appropriate metadata category"""
-        term = term.strip().upper()
-        result = defaultdict(set)
+    def _parse_entities(self, text: str) -> Dict[str, Set[str]]:
+        """Parse text for known entities"""
+        entities = {
+            'countries': set(),
+            'regions': set(),
+            'products': set(),
+            'topics': set(),
+            'client_types': set()
+        }
         
-        # Check if it's a country
-        if term in alias_mapping or term in alias_mapping.values():
-            proper_name = alias_mapping.get(term, term)
-            result['countries'].add(proper_name)
+        text_upper = text.upper().strip()
         
-        # Check if it's a region
-        regions = {'ASIA', 'EUROPE', 'AMERICAS', 'AFRICA', 'AME', 'EMEA', 'APAC'}
-        if term in regions:
-            result['regions'].add(term)
+        # Check for countries
+        for alias, proper_name in alias_mapping.items():
+            if re.search(rf"\b{re.escape(alias)}\b", text_upper):
+                entities['countries'].add(proper_name)
         
-        # Check if it's a product
-        products = {'CASH', 'TRADE', 'FX', 'SECURITIES', 'TREASURY'}
-        if term in products:
-            result['products'].add(term)
+        # Check for regions
+        regions = ['ASIA', 'EUROPE', 'AMERICAS', 'AFRICA', 'AME', 'EMEA', 'APAC']
+        for region in regions:
+            if re.search(rf"\b{re.escape(region)}\b", text_upper):
+                entities['regions'].add(region)
         
-        # Check if it's a topic
-        topics = {'S2B', 'ACH', 'RTGS', 'SWIFT', 'WIRE', 'SEPA', 'FAST', 'GIRO', 'MEPS'}
-        if term in topics:
-            result['topics'].add(term)
+        # Check for products
+        products = ['CASH', 'TRADE', 'FX', 'SECURITIES', 'TREASURY']
+        for product in products:
+            if re.search(rf"\b{re.escape(product)}\b", text_upper):
+                entities['products'].add(product)
         
-        # Check if it's a client type
-        client_types = {'CORPORATES', 'FI', 'RETAIL', 'INSTITUTIONAL', 'PAYTECH'}
-        if term in client_types:
-            result['client_types'].add(term)
+        # Check for topics
+        topics = ['S2B', 'ACH', 'RTGS', 'SWIFT', 'WIRE', 'SEPA']
+        for topic in topics:
+            if re.search(rf"\b{re.escape(topic)}\b", text_upper):
+                entities['topics'].add(topic)
         
-        # If no category matched, add to general
-        if not result:
-            result['general'].add(term)
+        # Check for client types
+        client_types = ['CORPORATES', 'FI', 'RETAIL', 'INSTITUTIONAL']
+        for client_type in client_types:
+            if re.search(rf"\b{re.escape(client_type)}\b", text_upper):
+                entities['client_types'].add(client_type)
         
-        return result
-    
-    def detect_contradictions(self, extracted_filters: Dict, negations: Dict) -> Dict[str, List[str]]:
-        """
-        Detect contradictions between extracted filters and negations
-        Returns filters that should be overridden
-        """
-        contradictions = {}
-        
-        # Check country contradictions
-        if 'country' in extracted_filters and negations.get('countries'):
-            filter_countries = set(extracted_filters['country'])
-            negated_countries = set(negations['countries'])
-            conflicts = filter_countries.intersection(negated_countries)
-            if conflicts:
-                contradictions['country'] = list(conflicts)
-        
-        # Check region contradictions
-        if 'region' in extracted_filters and negations.get('regions'):
-            filter_regions = set(extracted_filters['region'])
-            negated_regions = set(negations['regions'])
-            conflicts = filter_regions.intersection(negated_regions)
-            if conflicts:
-                contradictions['region'] = list(conflicts)
-        
-        # Check other metadata contradictions
-        for key in ['product', 'topic', 'client_type']:
-            if key in extracted_filters and negations.get(f'{key}s'):
-                filter_values = set(extracted_filters[key])
-                negated_values = set(negations[f'{key}s'])
-                conflicts = filter_values.intersection(negated_values)
-                if conflicts:
-                    contradictions[key] = list(conflicts)
-        
-        return contradictions
+        return entities
 
 # ========================================
-# INTEGRATED SEMANTIC SEARCH
+# FILTER ADJUSTMENT LOGIC
+# ========================================
+
+def adjust_filters_for_negations(
+    extracted_filters: Dict[str, List],
+    negations: Dict[str, List],
+    verbose: bool = False
+) -> Tuple[Dict, Dict]:
+    """
+    Adjust filters based on negations
+    Only removes contradicting values, doesn't add new ones
+    """
+    adjusted_filters = {}
+    removed_items = {}
+    
+    for key, values in extracted_filters.items():
+        if not values:
+            continue
+        
+        # Map filter keys to negation keys
+        negation_key_map = {
+            'country': 'countries',
+            'region': 'regions',
+            'product': 'products',
+            'topic': 'topics',
+            'client_type': 'client_types'
+        }
+        
+        neg_key = negation_key_map.get(key)
+        if neg_key and neg_key in negations and negations[neg_key]:
+            # Check for contradictions
+            filter_values_set = set(values)
+            negated_values_set = set(negations[neg_key])
+            
+            # Find values that are both in filter and negated
+            contradictions = filter_values_set.intersection(negated_values_set)
+            
+            if contradictions:
+                # Remove contradicting values
+                remaining_values = list(filter_values_set - contradictions)
+                if remaining_values:
+                    adjusted_filters[key] = remaining_values
+                # Track what was removed
+                removed_items[key] = list(contradictions)
+                
+                if verbose:
+                    print(f"⚠️ Removed {key}={list(contradictions)} due to negation")
+            else:
+                # No contradictions, keep original
+                adjusted_filters[key] = values
+        else:
+            # No negations for this key, keep original
+            adjusted_filters[key] = values
+    
+    return adjusted_filters, removed_items
+
+# ========================================
+# SEMANTIC SEARCH WITH PENALTIES
+# ========================================
+
+def semantic_search_with_penalties(
+    table,
+    model,
+    query_text: str,
+    filters: Dict[str, List],
+    negations: Dict[str, List],
+    limit: int = 20,
+    semantic_threshold: float = 0.7,
+    verbose: bool = False
+) -> Tuple[pd.DataFrame, int]:
+    """
+    Perform semantic search with filter boosts and negation penalties
+    """
+    
+    # Encode query
+    qvec = model.encode(query_text)
+    qvec = qvec / np.linalg.norm(qvec)
+    
+    # Stage 1: Get candidates (more than needed for re-ranking)
+    candidate_limit = min(limit * 5, 100)
+    
+    # Build filter string for initial retrieval (optional)
+    from lancedb_advanced_progressive_filter import build_filter_string
+    filter_string = build_filter_string(filters) if filters else None
+    
+    # Get candidates
+    search_query = table.search(qvec).metric("cosine").limit(candidate_limit)
+    if filter_string and filters:
+        # Apply filters for initial retrieval
+        search_query = search_query.where(filter_string)
+    
+    candidates_df = search_query.to_pandas()
+    
+    if len(candidates_df) == 0:
+        return pd.DataFrame(), 0
+    
+    # Stage 2: Score adjustment
+    candidates_df['semantic_score'] = 1 - candidates_df['_distance']
+    candidates_df['filter_score'] = 1.0
+    
+    # Boost documents matching filters
+    for key, values in filters.items():
+        if values and key in candidates_df.columns:
+            if isinstance(values, list):
+                matches = candidates_df[key].isin(values)
+            else:
+                matches = candidates_df[key] == values
+            
+            candidates_df.loc[matches, 'filter_score'] *= 1.3  # Boost matches
+            candidates_df.loc[~matches, 'filter_score'] *= 0.8  # Mild penalty for non-matches
+    
+    # Apply heavy penalties for negated items
+    if 'countries' in negations:
+        for country in negations['countries']:
+            if 'country' in candidates_df.columns:
+                mask = candidates_df['country'].str.upper() == country.upper()
+                candidates_df.loc[mask, 'filter_score'] *= 0.1  # Heavy penalty
+                if verbose and mask.any():
+                    print(f"   Penalized {mask.sum()} documents with country={country}")
+    
+    if 'regions' in negations:
+        for region in negations['regions']:
+            if 'region' in candidates_df.columns:
+                mask = candidates_df['region'].str.upper() == region.upper()
+                candidates_df.loc[mask, 'filter_score'] *= 0.1
+    
+    if 'topics' in negations:
+        for topic in negations['topics']:
+            if 'topic' in candidates_df.columns:
+                mask = candidates_df['topic'].str.upper() == topic.upper()
+                candidates_df.loc[mask, 'filter_score'] *= 0.1
+    
+    # Combine scores (semantic priority)
+    candidates_df['final_score'] = (
+        candidates_df['semantic_score'] * semantic_threshold +
+        candidates_df['filter_score'] * (1 - semantic_threshold)
+    )
+    
+    # Sort by final score and limit
+    results_df = candidates_df.nlargest(limit, 'final_score').reset_index(drop=True)
+    
+    return results_df, len(results_df)
+
+# ========================================
+# MAIN INTEGRATED SEARCH
 # ========================================
 
 def integrated_semantic_search(
@@ -349,103 +445,97 @@ def integrated_semantic_search(
     model,
     session_id: str,
     query_text: str,
-    override_filters: Dict[str, Any] = None,
     max_results: int = 20,
     semantic_threshold: float = 0.7,
+    enable_progressive: bool = True,
     verbose: bool = True
 ) -> Dict:
     """
-    Complete integrated search with metadata extraction and semantic priority
+    Complete integrated search pipeline
     
-    Process:
-    1. Extract metadata filters from query
-    2. Detect negations and contradictions
-    3. Adjust filters based on query intent
-    4. Perform semantic-priority progressive search
+    1. Extract metadata filters (respects them as final)
+    2. Detect negations
+    3. Adjust filters ONLY for contradictions
+    4. Perform semantic search with appropriate scoring
     """
     
     start_time = time.time()
-    analyzer = EnhancedQueryIntentAnalyzer()
-    
-    # Step 1: Extract metadata filters
-    extracted_filters, augmented_query = process_question(session_id, query_text)
-    
-    # Allow manual override of filters
-    if override_filters:
-        extracted_filters.update(override_filters)
-    
-    # Step 2: Extract negations from query
-    negations = analyzer.extract_negations_enhanced(query_text)
-    
-    # Step 3: Detect contradictions
-    contradictions = analyzer.detect_contradictions(extracted_filters, negations)
-    
-    # Step 4: Adjust filters based on contradictions
-    adjusted_filters = {}
-    removed_filters = {}
-    
-    for key, values in extracted_filters.items():
-        if key in contradictions:
-            # This filter contradicts the query intent
-            removed_filters[key] = values
-            if verbose:
-                print(f"⚠️ Removing contradicting filter: {key}={values}")
-                print(f"   Reason: Query contains negation for {contradictions[key]}")
-        else:
-            adjusted_filters[key] = values
+    analyzer = NegationAnalyzer()
     
     if verbose:
         print("\n" + "="*60)
         print("🔍 INTEGRATED SEMANTIC SEARCH")
         print("="*60)
-        print(f"Original query: '{query_text}'")
-        print(f"Augmented query: '{augmented_query}'")
+        print(f"Query: '{query_text}'")
+    
+    # Step 1: Extract metadata filters (these are FINAL, not to be augmented)
+    extracted_filters, processed_query = process_question(session_id, query_text)
+    
+    if verbose:
         print(f"Extracted filters: {extracted_filters}")
+    
+    # Step 2: Detect negations in query
+    negations = analyzer.extract_negations(query_text)
+    
+    if verbose and negations:
         print(f"Detected negations: {negations}")
-        print(f"Contradictions found: {contradictions}")
-        print(f"Adjusted filters: {adjusted_filters}")
+    
+    # Step 3: Adjust filters ONLY for contradictions
+    adjusted_filters, removed_items = adjust_filters_for_negations(
+        extracted_filters, negations, verbose
+    )
+    
+    if verbose:
+        if removed_items:
+            print(f"Removed contradicting items: {removed_items}")
+        print(f"Final filters to apply: {adjusted_filters}")
         print("-"*60)
     
-    # Step 5: Perform semantic-priority search with progressive relaxation
-    results = progressive_semantic_search_integrated(
-        table=table,
-        model=model,
-        query_text=augmented_query,
-        initial_filters=adjusted_filters,
-        negations=negations,
-        max_results=max_results,
-        semantic_threshold=semantic_threshold,
-        verbose=verbose
-    )
+    # Step 4: Perform search (with or without progressive relaxation)
+    if enable_progressive:
+        results = progressive_search_with_penalties(
+            table, model, query_text, adjusted_filters, negations,
+            max_results, semantic_threshold, verbose
+        )
+    else:
+        # Single search without progressive relaxation
+        results_df, count = semantic_search_with_penalties(
+            table, model, query_text, adjusted_filters, negations,
+            max_results, semantic_threshold, verbose
+        )
+        results = {
+            'results': results_df,
+            'applied_filters': adjusted_filters,
+            'removed_filters': [],
+            'iterations': 1
+        }
     
     # Add metadata to results
     results['original_query'] = query_text
-    results['augmented_query'] = augmented_query
     results['extracted_filters'] = extracted_filters
-    results['contradictions'] = contradictions
     results['negations'] = negations
+    results['removed_items'] = removed_items
     results['execution_time'] = time.time() - start_time
     
     return results
 
-def progressive_semantic_search_integrated(
+def progressive_search_with_penalties(
     table,
     model,
     query_text: str,
-    initial_filters: Dict[str, Any],
-    negations: Dict[str, List[str]],
+    initial_filters: Dict[str, List],
+    negations: Dict[str, List],
     max_results: int = 20,
     semantic_threshold: float = 0.7,
     verbose: bool = True
 ) -> Dict:
     """
-    Progressive search with semantic priority and negation handling
+    Progressive filter relaxation with negation penalties
     """
     
-    # Filter priority
     filter_priority = {
         "topic": 1,
-        "product": 2,
+        "product": 2, 
         "client_type": 3,
         "region": 4,
         "country": 5
@@ -458,15 +548,15 @@ def progressive_semantic_search_integrated(
     while True:
         iterations += 1
         
-        # Perform semantic search with negation penalties
-        results_df, count = semantic_search_with_negations(
+        # Search with current filters
+        results_df, count = semantic_search_with_penalties(
             table, model, query_text, active_filters, negations,
-            limit=max_results, semantic_threshold=semantic_threshold
+            max_results, semantic_threshold, verbose=(verbose and iterations == 1)
         )
         
         if verbose:
             print(f"\n📊 Iteration {iterations}:")
-            print(f"   Active filters: {list(active_filters.keys()) if active_filters else 'None'}")
+            print(f"   Active filters: {active_filters if active_filters else 'None'}")
             print(f"   Results found: {count}")
         
         # Check if we have enough results
@@ -475,23 +565,22 @@ def progressive_semantic_search_integrated(
                 if count >= max_results:
                     print(f"✅ Target reached with {count} results")
                 else:
-                    print(f"⚠️ All filters removed. Found {count} results")
+                    print(f"⚠️ No more filters to remove. Found {count} results")
             break
         
         # Remove lowest priority filter
-        if active_filters:
-            filters_by_priority = sorted(
-                active_filters.items(),
-                key=lambda x: filter_priority.get(x[0], 999)
-            )
+        filters_by_priority = sorted(
+            active_filters.items(),
+            key=lambda x: filter_priority.get(x[0], 999)
+        )
+        
+        if filters_by_priority:
+            key_to_remove, value_removed = filters_by_priority[0]
+            del active_filters[key_to_remove]
+            removed_filters.append({'key': key_to_remove, 'value': value_removed})
             
-            if filters_by_priority:
-                key_to_remove, value_removed = filters_by_priority[0]
-                del active_filters[key_to_remove]
-                removed_filters.append({'key': key_to_remove, 'value': value_removed})
-                
-                if verbose:
-                    print(f"   → Removing filter: {key_to_remove}")
+            if verbose:
+                print(f"   → Removing filter: {key_to_remove}")
     
     return {
         'results': results_df,
@@ -500,107 +589,24 @@ def progressive_semantic_search_integrated(
         'iterations': iterations
     }
 
-def semantic_search_with_negations(
-    table, model, query_text: str, filters: Dict,
-    negations: Dict, limit: int, semantic_threshold: float
-) -> Tuple[pd.DataFrame, int]:
-    """
-    Semantic search with negation penalties
-    """
-    
-    # Encode query
-    qvec = model.encode(query_text)
-    qvec = qvec / np.linalg.norm(qvec)
-    
-    # Get candidates (more than needed for re-ranking)
-    candidates_df = (
-        table.search(qvec)
-        .metric("cosine")
-        .limit(limit * 5)
-        .to_pandas()
-    )
-    
-    if len(candidates_df) == 0:
-        return pd.DataFrame(), 0
-    
-    # Calculate semantic scores
-    candidates_df['semantic_score'] = 1 - candidates_df['_distance']
-    
-    # Apply filter scoring
-    candidates_df['filter_score'] = 1.0
-    
-    # Boost matches with filters
-    for key, values in filters.items():
-        if values and key in candidates_df.columns:
-            if isinstance(values, list):
-                matches = candidates_df[key].isin(values)
-            else:
-                matches = candidates_df[key] == values
-            
-            candidates_df.loc[matches, 'filter_score'] *= 1.2
-            candidates_df.loc[~matches, 'filter_score'] *= 0.9
-    
-    # Apply negation penalties
-    if 'countries' in negations:
-        for country in negations['countries']:
-            if 'country' in candidates_df.columns:
-                mask = candidates_df['country'].str.upper() == country.upper()
-                candidates_df.loc[mask, 'filter_score'] *= 0.2  # Heavy penalty
-    
-    if 'regions' in negations:
-        for region in negations['regions']:
-            if 'region' in candidates_df.columns:
-                mask = candidates_df['region'].str.upper() == region.upper()
-                candidates_df.loc[mask, 'filter_score'] *= 0.2
-    
-    # Combine scores
-    candidates_df['final_score'] = (
-        candidates_df['semantic_score'] * semantic_threshold +
-        candidates_df['filter_score'] * (1 - semantic_threshold)
-    )
-    
-    # Sort and limit
-    results_df = candidates_df.nlargest(limit, 'final_score')
-    
-    return results_df, len(results_df)
-
 # ========================================
-# HELPER FUNCTIONS
-# ========================================
-
-def build_filter_string(filters: Dict[str, Any]) -> Optional[str]:
-    """Build SQL filter string (for fallback)"""
-    if not filters:
-        return None
-    
-    clauses = []
-    for key, values in filters.items():
-        if not values:
-            continue
-        
-        if isinstance(values, list):
-            if len(values) == 1:
-                clauses.append(f"{key} = '{values[0]}'")
-            else:
-                values_str = "', '".join(values)
-                clauses.append(f"{key} IN ('{values_str}')")
-        else:
-            clauses.append(f"{key} = '{values}'")
-    
-    return " AND ".join(clauses) if clauses else None
-
-# ========================================
-# USAGE EXAMPLE
+# USAGE EXAMPLES
 # ========================================
 
 def main():
-    """Example usage of integrated system"""
+    """Test the corrected system"""
     
     # Setup test database
-    db = lancedb.connect("./lancedb_integrated")
+    db = lancedb.connect("./lancedb_corrected")
     
-    # Sample documents
     documents = [
+        {
+            'text': 'ACH payment cut-off time for Bangladesh is 3:00 PM local time',
+            'metadata': {
+                'region': 'ASIA', 'country': 'BANGLADESH', 'topic': 'ACH',
+                'product': 'CASH', 'client_type': 'CORPORATES'
+            }
+        },
         {
             'text': 'S2B payment services available in Singapore for corporate clients',
             'metadata': {
@@ -609,21 +615,14 @@ def main():
             }
         },
         {
-            'text': 'S2B implementation for all Asian countries including Bangladesh',
-            'metadata': {
-                'region': 'ASIA', 'country': 'BANGLADESH', 'topic': 'S2B',
-                'product': 'CASH', 'client_type': 'CORPORATES'
-            }
-        },
-        {
-            'text': 'ACH payment system in Malaysia for retail banking',
+            'text': 'Cut-off times for Malaysia ACH payments are 4:00 PM',
             'metadata': {
                 'region': 'ASIA', 'country': 'MALAYSIA', 'topic': 'ACH',
                 'product': 'CASH', 'client_type': 'RETAIL'
             }
         },
         {
-            'text': 'S2B services for APAC region excluding Bangladesh and Myanmar',
+            'text': 'S2B implementation for all Asian countries except Bangladesh',
             'metadata': {
                 'region': 'ASIA', 'country': 'ALL', 'topic': 'S2B',
                 'product': 'CASH', 'client_type': 'CORPORATES'
@@ -648,50 +647,51 @@ def main():
         db.drop_table('documents')
     
     table = db.create_table('documents', pd.DataFrame(data))
-    print(f"✅ Created table with {len(data)} documents")
+    print(f"✅ Created table with {len(data)} documents\n")
     
-    # Test cases
-    print("\n" + "🚀"*30)
-    print("TEST 1: Query with negation")
-    print("🚀"*30)
+    # Test 1: Specific country query (should only filter Bangladesh)
+    print("="*60)
+    print("TEST 1: Specific Country Query")
+    print("="*60)
     
-    session_id = "test_session_1"
-    query1 = "S2B payment capability without Bangladesh for corporates"
+    session_id = "test1"
+    reset_filter_dict(session_id)
+    query1 = "What is the cut off time for Bangladesh?"
     
     result1 = integrated_semantic_search(
-        table=table,
-        model=model,
-        session_id=session_id,
-        query_text=query1,
+        table, model, session_id, query1,
         max_results=5,
-        semantic_threshold=0.7,
+        enable_progressive=False,
         verbose=True
     )
     
     print("\n📄 Results:")
     if 'results' in result1 and not result1['results'].empty:
         for idx, row in result1['results'].head(3).iterrows():
-            print(f"\n  Result {idx+1}:")
-            print(f"    Text: {row['text'][:80]}...")
-            print(f"    Country: {row['country']}")
-            if 'final_score' in row:
-                print(f"    Score: {row['final_score']:.3f}")
+            print(f"  {idx+1}. {row['text']}")
+            print(f"     Country: {row['country']}, Score: {row.get('final_score', 0):.3f}\n")
     
-    print("\n" + "🚀"*30)
-    print("TEST 2: Query with region expansion")
-    print("🚀"*30)
+    # Test 2: Query with negation
+    print("\n" + "="*60)
+    print("TEST 2: Query with Negation")
+    print("="*60)
     
-    session_id = "test_session_2"
-    query2 = "ACH services in APAC excluding Bangladesh"
+    session_id = "test2"
+    reset_filter_dict(session_id)
+    query2 = "S2B payment capability without Bangladesh"
     
     result2 = integrated_semantic_search(
-        table=table,
-        model=model,
-        session_id=session_id,
-        query_text=query2,
+        table, model, session_id, query2,
         max_results=5,
+        enable_progressive=True,
         verbose=True
     )
+    
+    print("\n📄 Results:")
+    if 'results' in result2 and not result2['results'].empty:
+        for idx, row in result2['results'].head(3).iterrows():
+            print(f"  {idx+1}. {row['text']}")
+            print(f"     Country: {row['country']}, Score: {row.get('final_score', 0):.3f}\n")
 
 if __name__ == "__main__":
     main()
