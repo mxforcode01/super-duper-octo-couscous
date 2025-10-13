@@ -1289,3 +1289,109 @@ if __name__ == "__main__":
     )
     
     print("\n✅ Semantic-first progressive search complete!")
+
+########################################################
+# Metadata extraction 
+from collections import defaultdict
+
+SESSION_STORE = {}
+
+def init_filter_dict():
+    return dict()
+
+def get_filter_dict(session_id:str):
+    if session_id not in SESSION_STORE:
+        SESSION_STORE[session_id] = init_filter_dict()
+    return SESSION_STORE[session_id]
+
+def reset_filter_dict(session_id:str):
+    SESSION_STORE[session_id] = init_filter_dict()
+
+def extend_unique(fd, key, values):
+    if not values:
+        return
+    # current = set(fd.get(key, []))
+    # current.update(values)
+    current = values # replace the value completely
+    fd[key] = list(current)
+
+def map_question_to_countries(question):
+    # Input: we have singapore and japan for ach payment --> SINGAPORE, JAPAN
+    found = set()
+    q_upper = question.upper()
+    for alias, proper_name in alias_mapping.items():
+        if re.search(rf"\b{re.escape(alias)}\b", q_upper):
+            found.add(proper_name)
+    return list(found)
+
+
+def map_question_to_region(question):
+    # Input: we have asia and ame for ach payment --> ASIA, AME
+    found = set()
+    q_upper = question.upper()
+    regions = ['ASIA', 'AME', 'EMEA']
+    for region in regions:
+        if re.search(rf"\b{re.escape(region)}\b", q_upper):
+            found.add(region)
+    return list(found)
+
+
+def map_unofficialregion_to_countries(question):
+    # Input: we have asia pacific for ach payment --> countries under asia pacific
+    found = set()
+    q_upper = question.upper()
+    for region_alias, country_listing in compiled_region_dict.items():
+        if re.search(rf"\b{re.escape(region_alias.upper())}\b", q_upper):
+            found.update(country_listing)
+    return list(found)
+
+def map_question_to_product(question):
+    found = set()
+    q_upper = question.upper()
+    products = ['ALL', 'CASH', 'TRADE']
+    for product in products:
+        if re.search(rf"\b{re.escape(product)}\b", q_upper):
+            found.add(product)
+    return list(found)
+
+def map_question_to_client_type(question):
+    found = set()
+    q_upper = question.upper()
+    client_types = ['ALL', 'CORPORATES', 'FI', 'FINANCIAL INSTITUTION', 'PAYTECH']
+    for client_type in client_types:
+        if re.search(rf"\b{re.escape(client_type)}\b", q_upper):
+            found.add(client_type)
+    return list(found)
+
+def map_question_to_s2b(question):
+    found = set()
+    s2b_ls = ['S2B', 'STRAIGHT2BANK']
+    q_upper = question.upper()
+    for word in s2b_ls:
+        if re.search(rf"\b{re.escape(word)}\b", q_upper):
+            found.add(word)
+    return list(found)
+
+def process_question(session_id: str, question:str):
+    fd = get_filter_dict(session_id)
+    
+    extracted_countries = map_question_to_countries(question)
+    extracted_region = map_question_to_region(question)
+    extracted_indirect_countries = map_unofficialregion_to_countries(question)
+    extracted_products = map_question_to_product(question)
+    extracted_client_types = map_question_to_client_type(question)
+    extracted_s2b = map_question_to_s2b(question)
+    if extracted_region and extracted_countries:
+        extracted_indirect_countries = []
+    if extracted_indirect_countries:
+        question += ", ".join(extracted_indirect_countries)
+    parsed_country = list(set(extracted_countries + extracted_indirect_countries))
+
+    extend_unique(fd, "country", parsed_country)
+    extend_unique(fd, "region", extracted_region)
+    extend_unique(fd, "product", extracted_products)
+    extend_unique(fd, "client_type", extracted_client_types)
+    extend_unique(fd, "topic", extracted_s2b)
+    
+    return fd, question
+    # return parsed_country, extracted_region, question
