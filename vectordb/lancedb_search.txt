@@ -1,798 +1,14 @@
-EMB_MODEL = SentenceTransformer(embedding_path)  # single source of truth
-
-def encode_text(text: str, normalize: bool = False):
-    v = EMB_MODEL.encode(text)
-    if normalize:
-        # cosine is scale-invariant if both sides normalized; keep it consistent
-        import numpy as np
-        n = np.linalg.norm(v)
-        if n > 0:
-            v = v / n
-    return v
-
-def make_query_text(q: str) -> str:
-    return "query: " + str(q)  # matches your Qdrant behavior
-
-def dump_into_lancedb(text_chunks, db_path, table_name):
-    db = lancedb.connect(db_path)
-    if table_name in db.table_names():
-        db.drop_table(table_name)
-
-    rows = []
-    for i, ch in enumerate(text_chunks):
-        rows.append({
-            "id": i,
-            "text": ch["text"],
-            "vector": encode_text(ch["text"], normalize=True),  # normalize on write
-            **ch["metadata"]
-        })
-    df = pd.DataFrame(rows)
-    tbl = db.create_table(table_name, df)
-
-    # Build an ANN index with cosine metric.
-    # If your dataset is small (<~100k), IVF_PQ is still fine; bump recall with nprobes later.
-    # If you prefer exact baseline first, comment this out and rely on flat scan while testing.
-    tbl.create_index(
-        column="vector",
-        index_type="ivf_pq",          # or "ivf_flat" / "hnsw" if available in your version
-        metric="cosine",
-        num_partitions=64,            # tune for your data size (e.g., ~sqrt(N))
-        num_sub_vectors=16            # PQ granularity; raise for better recall
-    )
-
-def lancedb_where_clause(filter_dict: dict | None) -> str | None:
-    if not filter_dict:
-        return None
-    parts = []
-    for k, v in filter_dict.items():
-        if v is None:
-            continue
-        # allow list-like values
-        if isinstance(v, (list, tuple, set)):
-            vv = [f"'{str(x).replace(\"'\", \"''\")}'" for x in v]
-            parts.append(f"{k} IN ({', '.join(vv)})")
-        else:
-            s = str(v).replace("'", "''")
-            parts.append(f"{k} = '{s}'")
-    return " AND ".join(parts) if parts else None
-
-def search_lancedb(query: str, table, top_k: int = 20, filter_dict: dict | None = None):
-    qtxt = make_query_text(query)
-    qvec = encode_text(qtxt, normalize=True)
-
-    # Build search
-    sq = table.search(qvec).metric("cosine")
-
-    # Prefilter BEFORE the ANN probe (closer to Qdrant’s integrated filter)
-    where = lancedb_where_clause(filter_dict)
-    if where:
-        sq = sq.where(where)  # LanceDB treats this as prefilter for the vector scan
-
-    # Overfetch similar to your Qdrant loop and refine
-    over_k = max(top_k * 3, top_k + 10)   # extra headroom
-    sq = sq.limit(over_k).refine_factor(3)   # re-rank a larger candidate set exactly
-
-    # Probe more partitions (higher recall; slower). Tune 8–32.
-    sq = sq.nprobes(16)
-
-    df = sq.to_pandas()
-
-    # Clip to final top_k (already ranked by distance)
-    return df.head(top_k)
-
-###########################################################
-# Qdrant
-from qdrant_client.http.models import SearchParams
-
-def dump_into_qdrant(chunks, collection_name="my_docs_bge"):
-    client = QdrantClient(path=qdrant_path)
-    client.recreate_collection(
-        collection_name=collection_name,
-        vectors_config=VectorParams(size=768, distance=Distance.COSINE)
-    )
-
-    rows = []
-    for i, ch in enumerate(chunks):
-        rows.append({
-            "id": i,
-            "text": ch["text"],
-            **ch["metadata"]
-        })
-
-    texts = [r["text"] for r in rows]
-    payloads = rows
-    vectors = [encode_text(t, normalize=True).tolist() for t in texts]  # normalize on write (optional but consistent)
-
-    ids = [r["id"] for r in rows]
-
-    client.upload_collection(
-        collection_name=collection_name,
-        vectors=vectors,
-        payload=payloads,
-        ids=ids,
-    )
-    return
-
-def search_qdrant(query, client, collection_name="my_docs_bge", top_k=20, stages: list[dict] | None=None):
-    if stages is None:
-        stages = [{}]
-
-    qtxt = make_query_text(query)
-    qvec = encode_text(qtxt, normalize=True).tolist()
-
-    results = []
-    seen_ids = set()
-    for stage in stages:
-        need = top_k - len(results)
-        if need <= 0:
-            break
-        flt = make_filter(stage)
-        hits = client.search(
-            collection_name=collection_name,
-            query_vector=qvec,
-            query_filter=flt,
-            limit=max(need*3, need+10),
-            with_payload=True,
-            params=SearchParams(hnsw_ef=128, exact=False)  # make “default” recall explicit
-        )
-        for pt in hits:
-            if pt.id not in seen_ids:
-                results.append(pt)
-                seen_ids.add(pt.id)
-                if len(results) >= top_k:
-                    break
-    return results
-
-##############################################################################################
-
-import numpy as np
-
-from typing import Any, Dict, Optional
-
-def _is_all(v: Any) -> bool:
-    return isinstance(v, str) and v.strip().upper() == "ALL"
-
-def _sql_quote(v: Any) -> str:
-    # Quote strings safely (double single quotes); pass numbers/bools through.
-    if isinstance(v, str):
-        return "'" + v.replace("'", "''") + "'"
-    if isinstance(v, bool):
-        return "TRUE" if v else "FALSE"
-    return str(v)
-
-def build_filter_string(filters: Dict[str, Any]) -> Optional[str]:
-    """
-    Build a LanceDB SQL-like WHERE clause from dict values.
-    Supports scalars and sequences. If any value in a key's list is 'ALL',
-    that key is skipped (no filtering on that field).
-    Examples:
-      {'country': ['SINGAPORE','MALAYSIA'], 'product':['CASH']}
-         -> "country IN ('SINGAPORE','MALAYSIA') AND product = 'CASH'"
-    """
-    if not filters:
-        return None
-
-    clauses = []
-    for key, raw in filters.items():
-        if raw is None:
-            continue
-
-        # Normalize to a list for uniform handling
-        if isinstance(raw, (list, tuple, set)):
-            values = [v for v in raw if v is not None and (not isinstance(v, str) or v.strip() != "")]
-        else:
-            values = [raw]
-
-        if not values:
-            continue
-
-        # If ANY value is 'ALL', skip this key entirely (no filter on it)
-        if any(_is_all(v) for v in values):
-            continue
-
-        # De-dupe while preserving order (case-insensitive for strings)
-        seen = set()
-        deduped = []
-        for v in values:
-            key_v = v.upper() if isinstance(v, str) else v
-            if key_v in seen:
-                continue
-            seen.add(key_v)
-            deduped.append(v)
-
-        # Emit = or IN (...)
-        if len(deduped) == 1:
-            clauses.append(f"{key} = {_sql_quote(deduped[0])}")
-        else:
-            joined = ", ".join(_sql_quote(v) for v in deduped)
-            clauses.append(f"{key} IN ({joined})")
-
-    return " AND ".join(clauses) if clauses else None
-
-
-def execute_search(
-    table,
-    model,
-    query_text: str,
-    filters: Dict[str, object],
-    limit: int = 20,
-    overfetch_mult: int = 3,
-    refine_factor: int = 3,
-    nprobes: int = 16,
-) -> Tuple[pd.DataFrame, int]:
-    """
-    Qdrant-like LanceDB search:
-    - cosine metric
-    - normalized query vector
-    - prefilter via .where(...)
-    - overfetch + refine + nprobes to raise recall
-    """
-    qtxt = make_query_text(query_text)
-    qvec = encode_query(model, qtxt, normalize=True)
-
-    # Drop any 'ALL' values to match your usual semantics
-    filters = drop_all_values(filters)
-    fstr = build_filter_string(filters)
-
-    # Overfetch similar to your Qdrant loop (need * 3)
-    over_k = max(limit * overfetch_mult, limit + 10)
-
-    sq = table.search(qvec).metric("cosine")
-    if fstr:
-        sq = sq.where(fstr)           # PREFILTER: affect the candidate set
-    sq = sq.nprobes(nprobes)          # probe more partitions (higher recall)
-    sq = sq.refine_factor(refine_factor)  # re-rank a larger candidate set exactly
-    sq = sq.limit(over_k)             # over-fetch then clip
-
-    df = sq.to_pandas()
-    # NOTE: LanceDB returns already sorted results (by distance/score).
-    # Clip to requested limit:
-    df = df.head(limit)
-    return df, len(df)
-
-FILTER_PRIORITY_DEFAULT = {
-    "topic": 1,
-    "product": 2,
-    "client_type": 3,
-    "region": 4,
-    "country": 5,
-}
-
-def clean_filters(filters: Dict[str, str]) -> Dict[str, str]:
-    return {k: v for k, v in (filters or {}).items() if v is not None and str(v) != ""}
-
-def order_filters_by_priority(
-    active_filters: Dict[str, str],
-    priority_map: Dict[str, int] = FILTER_PRIORITY_DEFAULT
-) -> List[Tuple[str, str]]:
-    return sorted(active_filters.items(), key=lambda kv: priority_map.get(kv[0], 999))
-
-def progressive_search(
-    table,
-    model,
-    query_text: str,
-    initial_filters: Dict[str, str],
-    max_results: int = 20,
-    filter_priority: Dict[str, int] = FILTER_PRIORITY_DEFAULT,
-    verbose: bool = True
-) -> pd.DataFrame:
-    active_filters = drop_all_values(clean_filters(initial_filters.copy()))
-    iterations = 0
-
-    # 1) Try with all filters
-    df, count = execute_search(table, model, query_text, active_filters, limit=max_results)
-    iterations += 1
-    if count >= max_results or (count > 0 and len(active_filters) == 0):
-        return df
-
-    # 2) Relax in priority order (topic → product → client_type → region → country)
-    for key, _ in order_filters_by_priority(active_filters, filter_priority):
-        active_filters.pop(key, None)
-        iterations += 1
-        df, count = execute_search(table, model, query_text, active_filters, limit=max_results)
-        if count >= max_results or not active_filters:
-            break
-
-    return df
-
-################################################################################
-# Claude 
 """
-LanceDB Advanced Progressive Filter System
-Integrates multi-value filtering, "ALL" handling, and optimized search
+Integrated Semantic-First Progressive Filter System
+Combines metadata extraction with query intent analysis
 """
 
 import lancedb
 import pandas as pd
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from typing import Any, Dict, Optional, List, Tuple
-import time
-
-# Initialize model
-model = SentenceTransformer('all-MiniLM-L6-v2')
-
-# ========================================
-# CORE FILTERING UTILITIES
-# ========================================
-
-def _is_all(v: Any) -> bool:
-    """Check if a value represents 'ALL' (no filtering)"""
-    return isinstance(v, str) and v.strip().upper() == "ALL"
-
-def _sql_quote(v: Any) -> str:
-    """Quote values safely for SQL-like queries"""
-    if isinstance(v, str):
-        return "'" + v.replace("'", "''") + "'"
-    if isinstance(v, bool):
-        return "TRUE" if v else "FALSE"
-    return str(v)
-
-def build_filter_string(filters: Dict[str, Any]) -> Optional[str]:
-    """
-    Build a LanceDB SQL-like WHERE clause from dict values.
-    Supports scalars and sequences. If any value in a key's list is 'ALL',
-    that key is skipped (no filtering on that field).
-    
-    Examples:
-      {'country': ['SINGAPORE','MALAYSIA'], 'product': 'CASH'}
-         -> "country IN ('SINGAPORE','MALAYSIA') AND product = 'CASH'"
-      {'country': 'ALL', 'product': 'CASH'}
-         -> "product = 'CASH'" (country is skipped)
-    """
-    if not filters:
-        return None
-
-    clauses = []
-    for key, raw in filters.items():
-        if raw is None:
-            continue
-
-        # Normalize to a list for uniform handling
-        if isinstance(raw, (list, tuple, set)):
-            values = [v for v in raw if v is not None and (not isinstance(v, str) or v.strip() != "")]
-        else:
-            values = [raw] if raw != "" else []
-
-        if not values:
-            continue
-
-        # If ANY value is 'ALL', skip this key entirely (no filter on it)
-        if any(_is_all(v) for v in values):
-            continue
-
-        # De-duplicate while preserving order (case-insensitive for strings)
-        seen = set()
-        deduped = []
-        for v in values:
-            key_v = v.upper() if isinstance(v, str) else v
-            if key_v in seen:
-                continue
-            seen.add(key_v)
-            deduped.append(v)
-
-        # Emit = or IN (...)
-        if len(deduped) == 1:
-            clauses.append(f"{key} = {_sql_quote(deduped[0])}")
-        else:
-            joined = ", ".join(_sql_quote(v) for v in deduped)
-            clauses.append(f"{key} IN ({joined})")
-
-    return " AND ".join(clauses) if clauses else None
-
-def drop_all_values(filters: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove any filter keys that have 'ALL' as their value"""
-    if not filters:
-        return {}
-    
-    cleaned = {}
-    for key, value in filters.items():
-        # Check if it's 'ALL' (single value or in a list)
-        if isinstance(value, (list, tuple, set)):
-            non_all_values = [v for v in value if not _is_all(v)]
-            if non_all_values:  # Only keep if there are non-ALL values
-                cleaned[key] = non_all_values if len(non_all_values) > 1 else non_all_values[0]
-        elif not _is_all(value):
-            cleaned[key] = value
-    
-    return cleaned
-
-def clean_filters(filters: Dict[str, Any]) -> Dict[str, Any]:
-    """Clean filters by removing None and empty string values"""
-    return {k: v for k, v in (filters or {}).items() 
-            if v is not None and (not isinstance(v, str) or v.strip() != "")}
-
-def encode_query(model, query_text: str, normalize: bool = True) -> np.ndarray:
-    """Encode query text to vector, optionally normalize for cosine similarity"""
-    vec = model.encode(query_text)
-    if normalize:
-        vec = vec / np.linalg.norm(vec)
-    return vec
-
-# ========================================
-# SEARCH EXECUTION
-# ========================================
-
-def execute_search(
-    table,
-    model,
-    query_text: str,
-    filters: Dict[str, Any],
-    limit: int = 20,
-    overfetch_mult: int = 3,
-    refine_factor: int = 3,
-    nprobes: int = 20,
-) -> Tuple[pd.DataFrame, int]:
-    """
-    Optimized LanceDB search with:
-    - Cosine similarity metric
-    - Normalized query vector
-    - Pre-filtering via where clause
-    - Overfetch + refine + nprobes for higher recall
-    
-    Args:
-        table: LanceDB table
-        model: Sentence transformer model
-        query_text: Search query
-        filters: Filter dictionary (supports lists and 'ALL' values)
-        limit: Maximum results to return
-        overfetch_mult: Multiplier for initial candidate retrieval
-        refine_factor: Re-ranking factor for accuracy
-        nprobes: Number of partitions to search (higher = better recall)
-    """
-    # Encode and normalize query
-    qvec = encode_query(model, query_text, normalize=True)
-    
-    # Clean filters and build SQL string
-    filters = drop_all_values(filters)
-    filter_string = build_filter_string(filters)
-    
-    # Overfetch to ensure we get enough results after filtering
-    over_k = max(limit * overfetch_mult, limit + 10)
-    
-    # Build search query
-    search_query = table.search(qvec).metric("cosine")
-    
-    if filter_string:
-        search_query = search_query.where(filter_string)
-    
-    search_query = (search_query
-                   .nprobes(nprobes)           # Probe more partitions
-                   .refine_factor(refine_factor)  # Re-rank candidates
-                   .limit(over_k))                # Over-fetch
-    
-    # Execute search
-    df = search_query.to_pandas()
-    
-    # Clip to requested limit
-    df = df.head(limit)
-    return df, len(df)
-
-# ========================================
-# PROGRESSIVE FILTER SYSTEM
-# ========================================
-
-# Default filter priority (lower number = removed first)
-FILTER_PRIORITY_DEFAULT = {
-    "topic": 1,        # Removed first
-    "product": 2,
-    "client_type": 3,
-    "region": 4,
-    "country": 5,      # Removed last (most important)
-}
-
-def order_filters_by_priority(
-    active_filters: Dict[str, Any],
-    priority_map: Dict[str, int] = None
-) -> List[Tuple[str, Any]]:
-    """Order filters by priority for progressive relaxation"""
-    if priority_map is None:
-        priority_map = FILTER_PRIORITY_DEFAULT
-    return sorted(active_filters.items(), 
-                 key=lambda kv: priority_map.get(kv[0], 999))
-
-def progressive_search(
-    table,
-    model,
-    query_text: str,
-    initial_filters: Dict[str, Any],
-    max_results: int = 20,
-    filter_priority: Dict[str, int] = None,
-    verbose: bool = True,
-    overfetch_mult: int = 3,
-    refine_factor: int = 3,
-    nprobes: int = 20,
-) -> Dict:
-    """
-    Progressive filter relaxation search with advanced filtering support.
-    
-    Supports:
-    - Multi-value filters: {'country': ['SINGAPORE', 'MALAYSIA']}
-    - 'ALL' values that disable filtering: {'country': 'ALL'}
-    - Progressive relaxation based on priority
-    - Optimized search with overfetch and refinement
-    
-    Args:
-        table: LanceDB table
-        model: Sentence transformer model
-        query_text: Search query
-        initial_filters: Initial filter dictionary
-        max_results: Target number of results
-        filter_priority: Custom priority map (optional)
-        verbose: Print detailed progress
-        overfetch_mult: Overfetch multiplier for better recall
-        refine_factor: Refinement factor for re-ranking
-        nprobes: Number of partitions to probe
-        
-    Returns:
-        Dictionary with results and metadata
-    """
-    start_time = time.time()
-    
-    if filter_priority is None:
-        filter_priority = FILTER_PRIORITY_DEFAULT
-    
-    # Clean and prepare filters
-    active_filters = drop_all_values(clean_filters(initial_filters.copy()))
-    removed_filters = []
-    iterations = 0
-    search_history = []
-    
-    if verbose:
-        print("\n" + "="*60)
-        print("🔍 PROGRESSIVE FILTER SEARCH (Advanced)")
-        print("="*60)
-        print(f"Query: '{query_text}'")
-        print(f"Initial filters: {initial_filters}")
-        print(f"Active filters (after ALL removal): {active_filters}")
-        print(f"Target results: {max_results}")
-        print(f"Search params: nprobes={nprobes}, refine={refine_factor}, overfetch={overfetch_mult}x")
-        print("-"*60)
-    
-    # 1) Try with all active filters
-    df, count = execute_search(
-        table, model, query_text, active_filters, 
-        limit=max_results, overfetch_mult=overfetch_mult,
-        refine_factor=refine_factor, nprobes=nprobes
-    )
-    iterations += 1
-    search_history.append({
-        'iteration': iterations,
-        'filters': active_filters.copy(),
-        'count': count
-    })
-    
-    if verbose:
-        filter_str = build_filter_string(active_filters) or "No filters"
-        print(f"\n📊 Iteration {iterations}: All filters applied")
-        print(f"   SQL: {filter_str}")
-        print(f"   Results found: {count}")
-    
-    # If we have enough results or no filters to relax, return
-    if count >= max_results or (count > 0 and len(active_filters) == 0):
-        if verbose:
-            print(f"\n✅ Search complete with {count} results")
-        
-        return {
-            'results': df,
-            'applied_filters': active_filters,
-            'removed_filters': removed_filters,
-            'search_iterations': iterations,
-            'search_history': search_history,
-            'execution_time': time.time() - start_time
-        }
-    
-    # 2) Progressive relaxation in priority order
-    for key, value in order_filters_by_priority(active_filters, filter_priority):
-        # Remove the filter
-        removed_value = active_filters.pop(key, None)
-        removed_filters.append({'key': key, 'value': removed_value})
-        iterations += 1
-        
-        # Execute search with relaxed filters
-        df, count = execute_search(
-            table, model, query_text, active_filters,
-            limit=max_results, overfetch_mult=overfetch_mult,
-            refine_factor=refine_factor, nprobes=nprobes
-        )
-        
-        search_history.append({
-            'iteration': iterations,
-            'filters': active_filters.copy(),
-            'removed': key,
-            'count': count
-        })
-        
-        if verbose:
-            filter_str = build_filter_string(active_filters) or "No filters"
-            print(f"\n📊 Iteration {iterations}: Removed '{key}' filter")
-            if isinstance(removed_value, list):
-                print(f"   Removed values: {removed_value}")
-            else:
-                print(f"   Removed value: {removed_value}")
-            print(f"   SQL: {filter_str}")
-            print(f"   Results found: {count}")
-        
-        # Check if we have enough results
-        if count >= max_results or not active_filters:
-            if verbose:
-                if count >= max_results:
-                    print(f"\n✅ Target reached! Found {count} results")
-                else:
-                    print(f"\n⚠️ All filters removed. Found {count} results")
-            break
-    
-    execution_time = time.time() - start_time
-    
-    if verbose:
-        print("\n" + "="*60)
-        print("📈 SEARCH SUMMARY")
-        print("="*60)
-        print(f"✓ Final result count: {count}")
-        print(f"✓ Filters applied: {active_filters if active_filters else 'None (pure similarity)'}")
-        print(f"✓ Filters removed: {[r['key'] for r in removed_filters]}")
-        print(f"✓ Iterations: {iterations}")
-        print(f"✓ Execution time: {execution_time:.3f}s")
-    
-    return {
-        'results': df,
-        'applied_filters': active_filters,
-        'removed_filters': removed_filters,
-        'search_iterations': iterations,
-        'search_history': search_history,
-        'execution_time': execution_time
-    }
-
-# ========================================
-# SETUP AND TESTING
-# ========================================
-
-def setup_test_database():
-    """Setup test database with sample data"""
-    
-    # Sample documents
-    documents = [
-        {
-            'text': 'Singapore ACH payment system for corporate clients in cash management',
-            'region': 'ASIA', 'country': 'SINGAPORE', 'topic': 'ACH',
-            'product': 'CASH', 'client_type': 'CORPORATES'
-        },
-        {
-            'text': 'Malaysian S2B implementation for retail banking services',
-            'region': 'ASIA', 'country': 'MALAYSIA', 'topic': 'S2B',
-            'product': 'CASH', 'client_type': 'RETAIL'
-        },
-        {
-            'text': 'SWIFT network for international transfers across Asian markets',
-            'region': 'ASIA', 'country': 'ALL', 'topic': 'SWIFT',
-            'product': 'FX', 'client_type': 'ALL'
-        },
-        {
-            'text': 'Thai payment infrastructure for corporate FX transactions',
-            'region': 'ASIA', 'country': 'THAILAND', 'topic': 'INFRASTRUCTURE',
-            'product': 'FX', 'client_type': 'CORPORATES'
-        },
-        {
-            'text': 'Singapore RTGS system for securities settlement',
-            'region': 'ASIA', 'country': 'SINGAPORE', 'topic': 'RTGS',
-            'product': 'SECURITIES', 'client_type': 'INSTITUTIONAL'
-        },
-        {
-            'text': 'European payment standards implementation in Germany',
-            'region': 'EUROPE', 'country': 'GERMANY', 'topic': 'STANDARDS',
-            'product': 'CASH', 'client_type': 'CORPORATES'
-        },
-    ]
-    
-    # Setup LanceDB
-    db = lancedb.connect("./lancedb_advanced")
-    
-    # Prepare data
-    data = []
-    for i, doc in enumerate(documents):
-        vec = encode_query(model, doc['text'], normalize=True)
-        record = {
-            'id': i,
-            'text': doc['text'],
-            'vector': vec,
-            **{k: v for k, v in doc.items() if k != 'text'}
-        }
-        data.append(record)
-    
-    # Create table
-    table_name = "documents"
-    if table_name in db.table_names():
-        db.drop_table(table_name)
-    
-    df = pd.DataFrame(data)
-    table = db.create_table(table_name, df)
-    
-    print(f"✅ Created table with {len(data)} documents")
-    return table
-
-# ========================================
-# EXAMPLE USAGE
-# ========================================
-
-if __name__ == "__main__":
-    # Setup database
-    table = setup_test_database()
-    
-    # Example 1: Multi-value filter
-    print("\n" + "🚀"*30)
-    print("EXAMPLE 1: Multi-Value Filter")
-    print("🚀"*30)
-    
-    filters1 = {
-        'country': ['SINGAPORE', 'MALAYSIA', 'THAILAND'],  # Multiple countries
-        'product': 'CASH',
-        'topic': 'UNKNOWN',  # Will likely need to be relaxed
-        'client_type': 'CORPORATES'
-    }
-    
-    result1 = progressive_search(
-        table, model,
-        query_text="payment systems for corporate clients",
-        initial_filters=filters1,
-        max_results=5,
-        verbose=True
-    )
-    
-    # Example 2: Filter with 'ALL' values
-    print("\n" + "🚀"*30)
-    print("EXAMPLE 2: Filter with 'ALL' Values")
-    print("🚀"*30)
-    
-    filters2 = {
-        'country': 'ALL',  # This will be ignored
-        'region': 'ASIA',
-        'product': ['CASH', 'FX'],  # Multiple products
-        'client_type': 'CORPORATES'
-    }
-    
-    result2 = progressive_search(
-        table, model,
-        query_text="Asian payment infrastructure",
-        initial_filters=filters2,
-        max_results=5,
-        verbose=True
-    )
-    
-    # Example 3: Very specific filter that needs relaxation
-    print("\n" + "🚀"*30)
-    print("EXAMPLE 3: Specific Filter Requiring Relaxation")
-    print("🚀"*30)
-    
-    filters3 = {
-        'country': 'SINGAPORE',
-        'product': 'CRYPTO',  # Doesn't exist
-        'topic': 'BLOCKCHAIN',  # Doesn't exist
-        'client_type': 'RETAIL',  # Mismatch
-        'region': 'ASIA'
-    }
-    
-    result3 = progressive_search(
-        table, model,
-        query_text="Singapore payment systems",
-        initial_filters=filters3,
-        max_results=3,
-        verbose=True
-    )
-    
-    print("\n✅ Advanced progressive filter system ready!")
-
-#################################################################
-##################################################################
-"""
-LanceDB Semantic-First Progressive Filter System
-Prioritizes query similarity over metadata filters
-"""
-
-import lancedb
-import pandas as pd
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple, Set
+from collections import defaultdict
 import time
 import re
 
@@ -800,13 +16,202 @@ import re
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # ========================================
-# SEMANTIC ANALYSIS
+# METADATA EXTRACTION (Your existing code)
 # ========================================
 
-class QueryIntentAnalyzer:
-    """Analyzes query intent for negative conditions and semantic meaning"""
+SESSION_STORE = {}
+
+# Alias mappings (extend as needed)
+alias_mapping = {
+    'SG': 'SINGAPORE',
+    'SINGAPORE': 'SINGAPORE',
+    'MY': 'MALAYSIA',
+    'MALAYSIA': 'MALAYSIA',
+    'TH': 'THAILAND',
+    'THAILAND': 'THAILAND',
+    'ID': 'INDONESIA',
+    'INDONESIA': 'INDONESIA',
+    'PH': 'PHILIPPINES',
+    'PHILIPPINES': 'PHILIPPINES',
+    'VN': 'VIETNAM',
+    'VIETNAM': 'VIETNAM',
+    'BD': 'BANGLADESH',
+    'BANGLADESH': 'BANGLADESH',
+    'IN': 'INDIA',
+    'INDIA': 'INDIA',
+    'CN': 'CHINA',
+    'CHINA': 'CHINA',
+    'JP': 'JAPAN',
+    'JAPAN': 'JAPAN',
+    'KR': 'KOREA',
+    'KOREA': 'KOREA',
+    'US': 'USA',
+    'USA': 'USA',
+    'UNITED STATES': 'USA',
+    'UK': 'UK',
+    'UNITED KINGDOM': 'UK',
+    'DE': 'GERMANY',
+    'GERMANY': 'GERMANY',
+    'FR': 'FRANCE',
+    'FRANCE': 'FRANCE',
+    'AU': 'AUSTRALIA',
+    'AUSTRALIA': 'AUSTRALIA',
+}
+
+# Regional groupings
+compiled_region_dict = {
+    'ASIA PACIFIC': ['SINGAPORE', 'MALAYSIA', 'THAILAND', 'INDONESIA', 'PHILIPPINES', 
+                     'VIETNAM', 'BANGLADESH', 'INDIA', 'CHINA', 'JAPAN', 'KOREA', 'AUSTRALIA'],
+    'APAC': ['SINGAPORE', 'MALAYSIA', 'THAILAND', 'INDONESIA', 'PHILIPPINES',
+             'VIETNAM', 'BANGLADESH', 'INDIA', 'CHINA', 'JAPAN', 'KOREA', 'AUSTRALIA'],
+    'SOUTHEAST ASIA': ['SINGAPORE', 'MALAYSIA', 'THAILAND', 'INDONESIA', 'PHILIPPINES', 'VIETNAM'],
+    'SEA': ['SINGAPORE', 'MALAYSIA', 'THAILAND', 'INDONESIA', 'PHILIPPINES', 'VIETNAM'],
+    'SOUTH ASIA': ['BANGLADESH', 'INDIA', 'PAKISTAN', 'SRI LANKA'],
+    'EAST ASIA': ['CHINA', 'JAPAN', 'KOREA'],
+}
+
+def init_filter_dict():
+    return dict()
+
+def get_filter_dict(session_id: str):
+    if session_id not in SESSION_STORE:
+        SESSION_STORE[session_id] = init_filter_dict()
+    return SESSION_STORE[session_id]
+
+def reset_filter_dict(session_id: str):
+    SESSION_STORE[session_id] = init_filter_dict()
+
+def extend_unique(fd, key, values):
+    if not values:
+        return
+    current = values  # replace the value completely
+    fd[key] = list(current)
+
+def map_question_to_countries(question):
+    found = set()
+    q_upper = question.upper()
+    for alias, proper_name in alias_mapping.items():
+        if re.search(rf"\b{re.escape(alias)}\b", q_upper):
+            found.add(proper_name)
+    return list(found)
+
+def map_question_to_region(question):
+    found = set()
+    q_upper = question.upper()
+    regions = ['ASIA', 'AME', 'EMEA', 'EUROPE', 'AMERICAS', 'AFRICA']
+    for region in regions:
+        if re.search(rf"\b{re.escape(region)}\b", q_upper):
+            found.add(region)
+    return list(found)
+
+def map_unofficialregion_to_countries(question):
+    found = set()
+    q_upper = question.upper()
+    for region_alias, country_listing in compiled_region_dict.items():
+        if re.search(rf"\b{re.escape(region_alias.upper())}\b", q_upper):
+            found.update(country_listing)
+    return list(found)
+
+def map_question_to_product(question):
+    found = set()
+    q_upper = question.upper()
+    products = ['ALL', 'CASH', 'TRADE', 'FX', 'SECURITIES', 'TREASURY']
+    for product in products:
+        if re.search(rf"\b{re.escape(product)}\b", q_upper):
+            found.add(product)
+    return list(found)
+
+def map_question_to_client_type(question):
+    found = set()
+    q_upper = question.upper()
+    client_types = ['ALL', 'CORPORATES', 'FI', 'FINANCIAL INSTITUTION', 'PAYTECH', 'RETAIL', 'INSTITUTIONAL']
+    
+    # Map variations to standard terms
+    client_map = {
+        'FINANCIAL INSTITUTION': 'FI',
+        'FI': 'FI',
+        'CORPORATES': 'CORPORATES',
+        'CORPORATE': 'CORPORATES',
+        'RETAIL': 'RETAIL',
+        'INSTITUTIONAL': 'INSTITUTIONAL',
+        'PAYTECH': 'PAYTECH'
+    }
+    
+    for client_type in client_types:
+        if re.search(rf"\b{re.escape(client_type)}\b", q_upper):
+            standardized = client_map.get(client_type, client_type)
+            found.add(standardized)
+    return list(found)
+
+def map_question_to_topic(question):
+    """Extended to include more topics beyond S2B"""
+    found = set()
+    q_upper = question.upper()
+    
+    # Topic variations and their standard forms
+    topic_patterns = {
+        'S2B': ['S2B', 'STRAIGHT2BANK', 'STRAIGHT 2 BANK'],
+        'ACH': ['ACH', 'AUTOMATED CLEARING HOUSE'],
+        'RTGS': ['RTGS', 'REAL TIME GROSS SETTLEMENT'],
+        'SWIFT': ['SWIFT'],
+        'WIRE': ['WIRE', 'WIRE TRANSFER'],
+        'SEPA': ['SEPA'],
+        'FAST': ['FAST', 'FAST PAYMENT'],
+        'GIRO': ['GIRO'],
+        'MEPS': ['MEPS'],
+    }
+    
+    for standard_topic, variations in topic_patterns.items():
+        for variant in variations:
+            if re.search(rf"\b{re.escape(variant)}\b", q_upper):
+                found.add(standard_topic)
+                break
+    
+    return list(found)
+
+def process_question(session_id: str, question: str):
+    """Extract metadata filters from question"""
+    fd = get_filter_dict(session_id)
+    
+    extracted_countries = map_question_to_countries(question)
+    extracted_region = map_question_to_region(question)
+    extracted_indirect_countries = map_unofficialregion_to_countries(question)
+    extracted_products = map_question_to_product(question)
+    extracted_client_types = map_question_to_client_type(question)
+    extracted_topics = map_question_to_topic(question)
+    
+    # If both region and countries are extracted, skip indirect countries
+    if extracted_region and extracted_countries:
+        extracted_indirect_countries = []
+    
+    # Augment question with indirect countries for better semantic search
+    if extracted_indirect_countries:
+        question += ", " + ", ".join(extracted_indirect_countries)
+    
+    # Combine all countries
+    parsed_country = list(set(extracted_countries + extracted_indirect_countries))
+    
+    # Update filter dictionary
+    extend_unique(fd, "country", parsed_country)
+    extend_unique(fd, "region", extracted_region)
+    extend_unique(fd, "product", extracted_products)
+    extend_unique(fd, "client_type", extracted_client_types)
+    extend_unique(fd, "topic", extracted_topics)
+    
+    return fd, question
+
+# ========================================
+# ENHANCED QUERY INTENT ANALYZER
+# ========================================
+
+class EnhancedQueryIntentAnalyzer:
+    """
+    Analyzes query intent for negations and contradictions
+    Integrates with metadata extraction
+    """
     
     def __init__(self):
+        # Negative patterns
         self.negative_patterns = [
             r'without\s+(\w+)',
             r'exclude\s+(\w+)',
@@ -816,284 +221,261 @@ class QueryIntentAnalyzer:
             r'no\s+(\w+)',
             r'avoid\s+(\w+)',
             r'skip\s+(\w+)',
+            r'minus\s+(\w+)',
+            r'remove\s+(\w+)',
+            r'omit\s+(\w+)',
         ]
         
-        # Common countries/regions for entity recognition
-        self.countries = {
-            'singapore', 'malaysia', 'thailand', 'indonesia', 'philippines',
-            'vietnam', 'bangladesh', 'india', 'china', 'japan', 'korea',
-            'usa', 'uk', 'germany', 'france', 'australia'
-        }
-        
-        self.regions = {'asia', 'europe', 'americas', 'africa', 'apac', 'emea'}
-        self.products = {'cash', 'fx', 'securities', 'trade', 'treasury'}
-        self.topics = {'s2b', 'ach', 'rtgs', 'swift', 'wire', 'sepa'}
+        # Multi-word negative patterns
+        self.multi_word_negative_patterns = [
+            r'without\s+([\w\s]+?)(?:\.|,|;|$)',
+            r'excluding\s+([\w\s]+?)(?:\.|,|;|$)',
+            r'except\s+(?:for\s+)?([\w\s]+?)(?:\.|,|;|$)',
+        ]
     
-    def extract_negations(self, query: str) -> Dict[str, List[str]]:
-        """Extract negative conditions from query"""
-        query_lower = query.lower()
+    def extract_negations_enhanced(self, question: str) -> Dict[str, Set[str]]:
+        """
+        Extract negations using both simple and complex patterns
+        Returns categorized negations
+        """
+        q_lower = question.lower()
         negations = {
-            'countries': [],
-            'regions': [],
-            'products': [],
-            'topics': [],
-            'general': []
+            'countries': set(),
+            'regions': set(),
+            'products': set(),
+            'topics': set(),
+            'client_types': set(),
+            'general': set()
         }
         
+        # Extract using simple patterns
         for pattern in self.negative_patterns:
-            matches = re.findall(pattern, query_lower)
+            matches = re.findall(pattern, q_lower)
             for match in matches:
-                # Categorize the negation
-                if match in self.countries:
-                    negations['countries'].append(match.upper())
-                elif match in self.regions:
-                    negations['regions'].append(match.upper())
-                elif match in self.products:
-                    negations['products'].append(match.upper())
-                elif match in self.topics:
-                    negations['topics'].append(match.upper())
-                else:
-                    negations['general'].append(match)
+                categorized = self._categorize_term(match)
+                for category, terms in categorized.items():
+                    negations[category].update(terms)
         
-        return negations
+        # Extract using multi-word patterns
+        for pattern in self.multi_word_negative_patterns:
+            matches = re.findall(pattern, q_lower)
+            for match in matches:
+                # Split multi-word matches and categorize each
+                words = match.strip().split()
+                for word in words:
+                    categorized = self._categorize_term(word)
+                    for category, terms in categorized.items():
+                        negations[category].update(terms)
+        
+        # Convert sets to lists
+        return {k: list(v) for k, v in negations.items()}
     
-    def should_override_filter(self, query: str, filter_key: str, filter_value: Any) -> bool:
+    def _categorize_term(self, term: str) -> Dict[str, Set[str]]:
+        """Categorize a term into appropriate metadata category"""
+        term = term.strip().upper()
+        result = defaultdict(set)
+        
+        # Check if it's a country
+        if term in alias_mapping or term in alias_mapping.values():
+            proper_name = alias_mapping.get(term, term)
+            result['countries'].add(proper_name)
+        
+        # Check if it's a region
+        regions = {'ASIA', 'EUROPE', 'AMERICAS', 'AFRICA', 'AME', 'EMEA', 'APAC'}
+        if term in regions:
+            result['regions'].add(term)
+        
+        # Check if it's a product
+        products = {'CASH', 'TRADE', 'FX', 'SECURITIES', 'TREASURY'}
+        if term in products:
+            result['products'].add(term)
+        
+        # Check if it's a topic
+        topics = {'S2B', 'ACH', 'RTGS', 'SWIFT', 'WIRE', 'SEPA', 'FAST', 'GIRO', 'MEPS'}
+        if term in topics:
+            result['topics'].add(term)
+        
+        # Check if it's a client type
+        client_types = {'CORPORATES', 'FI', 'RETAIL', 'INSTITUTIONAL', 'PAYTECH'}
+        if term in client_types:
+            result['client_types'].add(term)
+        
+        # If no category matched, add to general
+        if not result:
+            result['general'].add(term)
+        
+        return result
+    
+    def detect_contradictions(self, extracted_filters: Dict, negations: Dict) -> Dict[str, List[str]]:
         """
-        Determine if a filter should be overridden based on query semantics
-        
-        Returns True if the filter contradicts the query intent
+        Detect contradictions between extracted filters and negations
+        Returns filters that should be overridden
         """
-        negations = self.extract_negations(query)
+        contradictions = {}
         
-        # Check if filter value is in negations
-        if filter_key == 'country' and filter_value:
-            if isinstance(filter_value, str):
-                return filter_value.upper() in [n.upper() for n in negations['countries']]
-            elif isinstance(filter_value, list):
-                return any(v.upper() in [n.upper() for n in negations['countries']] 
-                          for v in filter_value)
+        # Check country contradictions
+        if 'country' in extracted_filters and negations.get('countries'):
+            filter_countries = set(extracted_filters['country'])
+            negated_countries = set(negations['countries'])
+            conflicts = filter_countries.intersection(negated_countries)
+            if conflicts:
+                contradictions['country'] = list(conflicts)
         
-        # Similar checks for other filter types
-        if filter_key == 'region' and filter_value:
-            if isinstance(filter_value, str):
-                return filter_value.upper() in [n.upper() for n in negations['regions']]
+        # Check region contradictions
+        if 'region' in extracted_filters and negations.get('regions'):
+            filter_regions = set(extracted_filters['region'])
+            negated_regions = set(negations['regions'])
+            conflicts = filter_regions.intersection(negated_regions)
+            if conflicts:
+                contradictions['region'] = list(conflicts)
         
-        return False
+        # Check other metadata contradictions
+        for key in ['product', 'topic', 'client_type']:
+            if key in extracted_filters and negations.get(f'{key}s'):
+                filter_values = set(extracted_filters[key])
+                negated_values = set(negations[f'{key}s'])
+                conflicts = filter_values.intersection(negated_values)
+                if conflicts:
+                    contradictions[key] = list(conflicts)
+        
+        return contradictions
 
 # ========================================
-# SEMANTIC-AWARE SEARCH
+# INTEGRATED SEMANTIC SEARCH
 # ========================================
 
-def semantic_priority_search(
+def integrated_semantic_search(
     table,
     model,
+    session_id: str,
     query_text: str,
-    filters: Dict[str, Any],
-    limit: int = 20,
+    override_filters: Dict[str, Any] = None,
+    max_results: int = 20,
     semantic_threshold: float = 0.7,
-    use_two_stage: bool = True,
-    verbose: bool = False
-) -> Tuple[pd.DataFrame, int, Dict]:
+    verbose: bool = True
+) -> Dict:
     """
-    Two-stage search that prioritizes semantic similarity
+    Complete integrated search with metadata extraction and semantic priority
     
-    Stage 1: Get top candidates by pure similarity (no filters)
-    Stage 2: Apply filters as soft constraints with scoring adjustment
+    Process:
+    1. Extract metadata filters from query
+    2. Detect negations and contradictions
+    3. Adjust filters based on query intent
+    4. Perform semantic-priority progressive search
     """
     
-    analyzer = QueryIntentAnalyzer()
-    negations = analyzer.extract_negations(query_text)
+    start_time = time.time()
+    analyzer = EnhancedQueryIntentAnalyzer()
     
-    # Encode query
-    qvec = model.encode(query_text)
-    qvec = qvec / np.linalg.norm(qvec)
+    # Step 1: Extract metadata filters
+    extracted_filters, augmented_query = process_question(session_id, query_text)
     
-    if use_two_stage:
-        # Stage 1: Get more candidates than needed without filters
-        candidate_limit = limit * 5  # Get 5x candidates
-        
-        if verbose:
-            print(f"\n📊 Stage 1: Semantic search for {candidate_limit} candidates")
-            print(f"   Negations detected: {negations}")
-        
-        candidates_df = (
-            table.search(qvec)
-            .metric("cosine")
-            .limit(candidate_limit)
-            .to_pandas()
-        )
-        
-        if len(candidates_df) == 0:
-            return pd.DataFrame(), 0, {'negations': negations}
-        
-        # Calculate semantic scores (convert distance to similarity)
-        candidates_df['semantic_score'] = 1 - candidates_df['_distance']
-        
-        # Stage 2: Score adjustment based on filters and negations
-        if verbose:
-            print(f"\n📊 Stage 2: Applying smart filtering")
-        
-        # Apply positive filters as soft constraints
-        candidates_df['filter_score'] = 1.0
-        
-        for key, value in filters.items():
-            if value and not analyzer.should_override_filter(query_text, key, value):
-                # Apply filter as scoring factor
-                if isinstance(value, list):
-                    matches = candidates_df[key].isin(value)
-                else:
-                    matches = candidates_df[key] == value
-                
-                # Boost score for matches, penalize non-matches
-                candidates_df.loc[matches, 'filter_score'] *= 1.2
-                candidates_df.loc[~matches, 'filter_score'] *= 0.8
-        
-        # Apply negation penalties
-        for country in negations['countries']:
-            mask = candidates_df['country'].str.upper() == country.upper()
-            candidates_df.loc[mask, 'filter_score'] *= 0.3  # Heavy penalty
-            
-        for region in negations['regions']:
-            mask = candidates_df['region'].str.upper() == region.upper()
-            candidates_df.loc[mask, 'filter_score'] *= 0.3
-        
-        # Combine scores (semantic takes priority)
-        candidates_df['final_score'] = (
-            candidates_df['semantic_score'] * semantic_threshold +
-            candidates_df['filter_score'] * (1 - semantic_threshold)
-        )
-        
-        # Sort by final score and limit
-        results_df = candidates_df.nlargest(limit, 'final_score')
-        
-        if verbose:
-            print(f"   Results after smart filtering: {len(results_df)}")
-            print(f"   Top result score: semantic={results_df.iloc[0]['semantic_score']:.3f}, "
-                  f"filter={results_df.iloc[0]['filter_score']:.3f}, "
-                  f"final={results_df.iloc[0]['final_score']:.3f}")
-        
-        return results_df, len(results_df), {'negations': negations}
+    # Allow manual override of filters
+    if override_filters:
+        extracted_filters.update(override_filters)
     
-    else:
-        # Fallback: Traditional filter-based search
-        from lancedb_advanced_progressive_filter import build_filter_string, drop_all_values
-        
-        clean_filters = drop_all_values(filters)
-        filter_string = build_filter_string(clean_filters)
-        
-        search_query = table.search(qvec).metric("cosine")
-        if filter_string:
-            search_query = search_query.where(filter_string)
-        
-        results_df = search_query.limit(limit).to_pandas()
-        return results_df, len(results_df), {'negations': negations}
+    # Step 2: Extract negations from query
+    negations = analyzer.extract_negations_enhanced(query_text)
+    
+    # Step 3: Detect contradictions
+    contradictions = analyzer.detect_contradictions(extracted_filters, negations)
+    
+    # Step 4: Adjust filters based on contradictions
+    adjusted_filters = {}
+    removed_filters = {}
+    
+    for key, values in extracted_filters.items():
+        if key in contradictions:
+            # This filter contradicts the query intent
+            removed_filters[key] = values
+            if verbose:
+                print(f"⚠️ Removing contradicting filter: {key}={values}")
+                print(f"   Reason: Query contains negation for {contradictions[key]}")
+        else:
+            adjusted_filters[key] = values
+    
+    if verbose:
+        print("\n" + "="*60)
+        print("🔍 INTEGRATED SEMANTIC SEARCH")
+        print("="*60)
+        print(f"Original query: '{query_text}'")
+        print(f"Augmented query: '{augmented_query}'")
+        print(f"Extracted filters: {extracted_filters}")
+        print(f"Detected negations: {negations}")
+        print(f"Contradictions found: {contradictions}")
+        print(f"Adjusted filters: {adjusted_filters}")
+        print("-"*60)
+    
+    # Step 5: Perform semantic-priority search with progressive relaxation
+    results = progressive_semantic_search_integrated(
+        table=table,
+        model=model,
+        query_text=augmented_query,
+        initial_filters=adjusted_filters,
+        negations=negations,
+        max_results=max_results,
+        semantic_threshold=semantic_threshold,
+        verbose=verbose
+    )
+    
+    # Add metadata to results
+    results['original_query'] = query_text
+    results['augmented_query'] = augmented_query
+    results['extracted_filters'] = extracted_filters
+    results['contradictions'] = contradictions
+    results['negations'] = negations
+    results['execution_time'] = time.time() - start_time
+    
+    return results
 
-# ========================================
-# PROGRESSIVE SEARCH WITH SEMANTIC PRIORITY
-# ========================================
-
-def progressive_semantic_search(
+def progressive_semantic_search_integrated(
     table,
     model,
     query_text: str,
     initial_filters: Dict[str, Any],
+    negations: Dict[str, List[str]],
     max_results: int = 20,
-    filter_priority: Dict[str, int] = None,
     semantic_threshold: float = 0.7,
-    min_semantic_score: float = 0.3,
     verbose: bool = True
 ) -> Dict:
     """
-    Progressive filter relaxation with semantic priority
-    
-    Key improvements:
-    1. Detects negative conditions in query
-    2. Overrides filters that contradict query intent
-    3. Uses two-stage retrieval to prioritize semantics
-    4. Applies filters as soft constraints
+    Progressive search with semantic priority and negation handling
     """
     
-    start_time = time.time()
-    analyzer = QueryIntentAnalyzer()
+    # Filter priority
+    filter_priority = {
+        "topic": 1,
+        "product": 2,
+        "client_type": 3,
+        "region": 4,
+        "country": 5
+    }
     
-    # Default priority
-    if filter_priority is None:
-        filter_priority = {
-            "topic": 1,
-            "product": 2,
-            "client_type": 3,
-            "region": 4,
-            "country": 5
-        }
-    
-    # Analyze query for negations
-    negations = analyzer.extract_negations(query_text)
-    
-    # Clean filters and check for contradictions
-    active_filters = {}
-    overridden_filters = {}
-    
-    for key, value in initial_filters.items():
-        if value and value != 'ALL':
-            if analyzer.should_override_filter(query_text, key, value):
-                overridden_filters[key] = value
-                if verbose:
-                    print(f"⚠️ Overriding filter {key}={value} due to query negation")
-            else:
-                active_filters[key] = value
-    
-    if verbose:
-        print("\n" + "="*60)
-        print("🔍 SEMANTIC-FIRST PROGRESSIVE SEARCH")
-        print("="*60)
-        print(f"Query: '{query_text}'")
-        print(f"Detected negations: {negations}")
-        print(f"Initial filters: {initial_filters}")
-        print(f"Active filters: {active_filters}")
-        print(f"Overridden filters: {overridden_filters}")
-        print(f"Semantic threshold: {semantic_threshold}")
-        print("-"*60)
-    
-    iterations = 0
+    active_filters = initial_filters.copy()
     removed_filters = []
-    search_history = []
+    iterations = 0
     
-    # Try with current filters
     while True:
         iterations += 1
         
-        # Perform semantic-priority search
-        results_df, count, metadata = semantic_priority_search(
-            table, model, query_text, active_filters,
-            limit=max_results, 
-            semantic_threshold=semantic_threshold,
-            use_two_stage=True,
-            verbose=verbose and iterations == 1
+        # Perform semantic search with negation penalties
+        results_df, count = semantic_search_with_negations(
+            table, model, query_text, active_filters, negations,
+            limit=max_results, semantic_threshold=semantic_threshold
         )
         
-        search_history.append({
-            'iteration': iterations,
-            'filters': active_filters.copy(),
-            'count': count
-        })
-        
         if verbose:
-            print(f"\n📊 Iteration {iterations}: ")
+            print(f"\n📊 Iteration {iterations}:")
             print(f"   Active filters: {list(active_filters.keys()) if active_filters else 'None'}")
             print(f"   Results found: {count}")
-            if count > 0 and 'semantic_score' in results_df.columns:
-                avg_semantic = results_df['semantic_score'].mean()
-                print(f"   Avg semantic score: {avg_semantic:.3f}")
         
-        # Check termination conditions
-        if count >= max_results:
+        # Check if we have enough results
+        if count >= max_results or not active_filters:
             if verbose:
-                print(f"\n✅ Target reached with {count} results")
-            break
-        
-        if not active_filters:
-            if verbose:
-                print(f"\n⚠️ All filters removed. Returning {count} results")
+                if count >= max_results:
+                    print(f"✅ Target reached with {count} results")
+                else:
+                    print(f"⚠️ All filters removed. Found {count} results")
             break
         
         # Remove lowest priority filter
@@ -1109,84 +491,147 @@ def progressive_semantic_search(
                 removed_filters.append({'key': key_to_remove, 'value': value_removed})
                 
                 if verbose:
-                    print(f"   → Removing filter: {key_to_remove}={value_removed}")
-        else:
-            break
-    
-    # Filter results by minimum semantic score
-    if count > 0 and 'semantic_score' in results_df.columns:
-        results_df = results_df[results_df['semantic_score'] >= min_semantic_score]
-        if verbose and len(results_df) < count:
-            print(f"\n📝 Filtered {count - len(results_df)} results below semantic threshold {min_semantic_score}")
-    
-    execution_time = time.time() - start_time
-    
-    if verbose:
-        print("\n" + "="*60)
-        print("📈 SEARCH SUMMARY")
-        print("="*60)
-        print(f"✓ Final result count: {len(results_df)}")
-        print(f"✓ Query negations: {negations}")
-        print(f"✓ Overridden filters: {list(overridden_filters.keys())}")
-        print(f"✓ Applied filters: {active_filters if active_filters else 'None'}")
-        print(f"✓ Removed filters: {[r['key'] for r in removed_filters]}")
-        print(f"✓ Iterations: {iterations}")
-        print(f"✓ Execution time: {execution_time:.3f}s")
+                    print(f"   → Removing filter: {key_to_remove}")
     
     return {
         'results': results_df,
         'applied_filters': active_filters,
         'removed_filters': removed_filters,
-        'overridden_filters': overridden_filters,
-        'negations': negations,
-        'iterations': iterations,
-        'execution_time': execution_time
+        'iterations': iterations
     }
 
+def semantic_search_with_negations(
+    table, model, query_text: str, filters: Dict,
+    negations: Dict, limit: int, semantic_threshold: float
+) -> Tuple[pd.DataFrame, int]:
+    """
+    Semantic search with negation penalties
+    """
+    
+    # Encode query
+    qvec = model.encode(query_text)
+    qvec = qvec / np.linalg.norm(qvec)
+    
+    # Get candidates (more than needed for re-ranking)
+    candidates_df = (
+        table.search(qvec)
+        .metric("cosine")
+        .limit(limit * 5)
+        .to_pandas()
+    )
+    
+    if len(candidates_df) == 0:
+        return pd.DataFrame(), 0
+    
+    # Calculate semantic scores
+    candidates_df['semantic_score'] = 1 - candidates_df['_distance']
+    
+    # Apply filter scoring
+    candidates_df['filter_score'] = 1.0
+    
+    # Boost matches with filters
+    for key, values in filters.items():
+        if values and key in candidates_df.columns:
+            if isinstance(values, list):
+                matches = candidates_df[key].isin(values)
+            else:
+                matches = candidates_df[key] == values
+            
+            candidates_df.loc[matches, 'filter_score'] *= 1.2
+            candidates_df.loc[~matches, 'filter_score'] *= 0.9
+    
+    # Apply negation penalties
+    if 'countries' in negations:
+        for country in negations['countries']:
+            if 'country' in candidates_df.columns:
+                mask = candidates_df['country'].str.upper() == country.upper()
+                candidates_df.loc[mask, 'filter_score'] *= 0.2  # Heavy penalty
+    
+    if 'regions' in negations:
+        for region in negations['regions']:
+            if 'region' in candidates_df.columns:
+                mask = candidates_df['region'].str.upper() == region.upper()
+                candidates_df.loc[mask, 'filter_score'] *= 0.2
+    
+    # Combine scores
+    candidates_df['final_score'] = (
+        candidates_df['semantic_score'] * semantic_threshold +
+        candidates_df['filter_score'] * (1 - semantic_threshold)
+    )
+    
+    # Sort and limit
+    results_df = candidates_df.nlargest(limit, 'final_score')
+    
+    return results_df, len(results_df)
+
 # ========================================
-# TESTING
+# HELPER FUNCTIONS
 # ========================================
 
-def setup_test_database_with_countries():
-    """Setup test database with country-specific data"""
+def build_filter_string(filters: Dict[str, Any]) -> Optional[str]:
+    """Build SQL filter string (for fallback)"""
+    if not filters:
+        return None
     
+    clauses = []
+    for key, values in filters.items():
+        if not values:
+            continue
+        
+        if isinstance(values, list):
+            if len(values) == 1:
+                clauses.append(f"{key} = '{values[0]}'")
+            else:
+                values_str = "', '".join(values)
+                clauses.append(f"{key} IN ('{values_str}')")
+        else:
+            clauses.append(f"{key} = '{values}'")
+    
+    return " AND ".join(clauses) if clauses else None
+
+# ========================================
+# USAGE EXAMPLE
+# ========================================
+
+def main():
+    """Example usage of integrated system"""
+    
+    # Setup test database
+    db = lancedb.connect("./lancedb_integrated")
+    
+    # Sample documents
     documents = [
         {
             'text': 'S2B payment services available in Singapore for corporate clients',
-            'region': 'ASIA', 'country': 'SINGAPORE', 'topic': 'S2B',
-            'product': 'CASH', 'client_type': 'CORPORATES'
+            'metadata': {
+                'region': 'ASIA', 'country': 'SINGAPORE', 'topic': 'S2B',
+                'product': 'CASH', 'client_type': 'CORPORATES'
+            }
         },
         {
-            'text': 'S2B implementation across all Asian countries including Bangladesh',
-            'region': 'ASIA', 'country': 'BANGLADESH', 'topic': 'S2B',
-            'product': 'CASH', 'client_type': 'CORPORATES'
+            'text': 'S2B implementation for all Asian countries including Bangladesh',
+            'metadata': {
+                'region': 'ASIA', 'country': 'BANGLADESH', 'topic': 'S2B',
+                'product': 'CASH', 'client_type': 'CORPORATES'
+            }
         },
         {
-            'text': 'S2B payment network for Malaysia Thailand and Indonesia',
-            'region': 'ASIA', 'country': 'MALAYSIA', 'topic': 'S2B',
-            'product': 'CASH', 'client_type': 'CORPORATES'
+            'text': 'ACH payment system in Malaysia for retail banking',
+            'metadata': {
+                'region': 'ASIA', 'country': 'MALAYSIA', 'topic': 'ACH',
+                'product': 'CASH', 'client_type': 'RETAIL'
+            }
         },
         {
-            'text': 'ACH system implementation in Bangladesh for retail banking',
-            'region': 'ASIA', 'country': 'BANGLADESH', 'topic': 'ACH',
-            'product': 'CASH', 'client_type': 'RETAIL'
-        },
-        {
-            'text': 'SWIFT network connecting Asian markets excluding certain countries',
-            'region': 'ASIA', 'country': 'ALL', 'topic': 'SWIFT',
-            'product': 'FX', 'client_type': 'ALL'
-        },
-        {
-            'text': 'S2B corporate solutions for APAC region without Bangladesh market',
-            'region': 'ASIA', 'country': 'ALL', 'topic': 'S2B',
-            'product': 'CASH', 'client_type': 'CORPORATES'
-        },
+            'text': 'S2B services for APAC region excluding Bangladesh and Myanmar',
+            'metadata': {
+                'region': 'ASIA', 'country': 'ALL', 'topic': 'S2B',
+                'product': 'CASH', 'client_type': 'CORPORATES'
+            }
+        }
     ]
     
-    # Setup LanceDB
-    db = lancedb.connect("./lancedb_semantic")
-    
-    # Prepare data
+    # Create table
     data = []
     for i, doc in enumerate(documents):
         vec = model.encode(doc['text'])
@@ -1195,203 +640,58 @@ def setup_test_database_with_countries():
             'id': i,
             'text': doc['text'],
             'vector': vec,
-            **{k: v for k, v in doc.items() if k != 'text'}
+            **doc['metadata']
         }
         data.append(record)
     
-    # Create table
-    table_name = "documents"
-    if table_name in db.table_names():
-        db.drop_table(table_name)
+    if 'documents' in db.table_names():
+        db.drop_table('documents')
     
-    df = pd.DataFrame(data)
-    table = db.create_table(table_name, df)
-    
+    table = db.create_table('documents', pd.DataFrame(data))
     print(f"✅ Created table with {len(data)} documents")
-    return table
+    
+    # Test cases
+    print("\n" + "🚀"*30)
+    print("TEST 1: Query with negation")
+    print("🚀"*30)
+    
+    session_id = "test_session_1"
+    query1 = "S2B payment capability without Bangladesh for corporates"
+    
+    result1 = integrated_semantic_search(
+        table=table,
+        model=model,
+        session_id=session_id,
+        query_text=query1,
+        max_results=5,
+        semantic_threshold=0.7,
+        verbose=True
+    )
+    
+    print("\n📄 Results:")
+    if 'results' in result1 and not result1['results'].empty:
+        for idx, row in result1['results'].head(3).iterrows():
+            print(f"\n  Result {idx+1}:")
+            print(f"    Text: {row['text'][:80]}...")
+            print(f"    Country: {row['country']}")
+            if 'final_score' in row:
+                print(f"    Score: {row['final_score']:.3f}")
+    
+    print("\n" + "🚀"*30)
+    print("TEST 2: Query with region expansion")
+    print("🚀"*30)
+    
+    session_id = "test_session_2"
+    query2 = "ACH services in APAC excluding Bangladesh"
+    
+    result2 = integrated_semantic_search(
+        table=table,
+        model=model,
+        session_id=session_id,
+        query_text=query2,
+        max_results=5,
+        verbose=True
+    )
 
 if __name__ == "__main__":
-    # Setup database
-    table = setup_test_database_with_countries()
-    
-    # Test 1: Query with negative condition
-    print("\n" + "🚀"*30)
-    print("TEST 1: Query with Negative Condition")
-    print("🚀"*30)
-    
-    # The query asks for S2B WITHOUT Bangladesh
-    # But the filter might extract Bangladesh as country
-    query1 = "S2B payment capability without Bangladesh"
-    filters1 = {
-        'country': 'BANGLADESH',  # This contradicts the query!
-        'topic': 'S2B',
-        'client_type': 'CORPORATES'
-    }
-    
-    result1 = progressive_semantic_search(
-        table, model,
-        query_text=query1,
-        initial_filters=filters1,
-        max_results=5,
-        semantic_threshold=0.7,  # 70% weight to semantic similarity
-        verbose=True
-    )
-    
-    print("\n🔍 Results:")
-    if not result1['results'].empty:
-        for idx, row in result1['results'].head().iterrows():
-            print(f"\n📄 Result {idx+1}:")
-            print(f"   Text: {row['text'][:80]}...")
-            print(f"   Country: {row['country']}")
-            if 'semantic_score' in row:
-                print(f"   Semantic score: {row['semantic_score']:.3f}")
-            if 'final_score' in row:
-                print(f"   Final score: {row['final_score']:.3f}")
-    
-    # Test 2: Query asking for exclusion
-    print("\n" + "🚀"*30)
-    print("TEST 2: Query with Multiple Exclusions")
-    print("🚀"*30)
-    
-    query2 = "Asian payment systems excluding Bangladesh and India"
-    filters2 = {
-        'region': 'ASIA',
-        'topic': 'S2B'
-    }
-    
-    result2 = progressive_semantic_search(
-        table, model,
-        query_text=query2,
-        initial_filters=filters2,
-        max_results=5,
-        semantic_threshold=0.75,
-        verbose=True
-    )
-    
-    # Test 3: Positive query matching filter
-    print("\n" + "🚀"*30)
-    print("TEST 3: Positive Query (Filter Aligned)")
-    print("🚀"*30)
-    
-    query3 = "S2B payment in Singapore"
-    filters3 = {
-        'country': 'SINGAPORE',
-        'topic': 'S2B'
-    }
-    
-    result3 = progressive_semantic_search(
-        table, model,
-        query_text=query3,
-        initial_filters=filters3,
-        max_results=3,
-        semantic_threshold=0.6,
-        verbose=True
-    )
-    
-    print("\n✅ Semantic-first progressive search complete!")
-
-########################################################
-# Metadata extraction 
-from collections import defaultdict
-
-SESSION_STORE = {}
-
-def init_filter_dict():
-    return dict()
-
-def get_filter_dict(session_id:str):
-    if session_id not in SESSION_STORE:
-        SESSION_STORE[session_id] = init_filter_dict()
-    return SESSION_STORE[session_id]
-
-def reset_filter_dict(session_id:str):
-    SESSION_STORE[session_id] = init_filter_dict()
-
-def extend_unique(fd, key, values):
-    if not values:
-        return
-    # current = set(fd.get(key, []))
-    # current.update(values)
-    current = values # replace the value completely
-    fd[key] = list(current)
-
-def map_question_to_countries(question):
-    # Input: we have singapore and japan for ach payment --> SINGAPORE, JAPAN
-    found = set()
-    q_upper = question.upper()
-    for alias, proper_name in alias_mapping.items():
-        if re.search(rf"\b{re.escape(alias)}\b", q_upper):
-            found.add(proper_name)
-    return list(found)
-
-
-def map_question_to_region(question):
-    # Input: we have asia and ame for ach payment --> ASIA, AME
-    found = set()
-    q_upper = question.upper()
-    regions = ['ASIA', 'AME', 'EMEA']
-    for region in regions:
-        if re.search(rf"\b{re.escape(region)}\b", q_upper):
-            found.add(region)
-    return list(found)
-
-
-def map_unofficialregion_to_countries(question):
-    # Input: we have asia pacific for ach payment --> countries under asia pacific
-    found = set()
-    q_upper = question.upper()
-    for region_alias, country_listing in compiled_region_dict.items():
-        if re.search(rf"\b{re.escape(region_alias.upper())}\b", q_upper):
-            found.update(country_listing)
-    return list(found)
-
-def map_question_to_product(question):
-    found = set()
-    q_upper = question.upper()
-    products = ['ALL', 'CASH', 'TRADE']
-    for product in products:
-        if re.search(rf"\b{re.escape(product)}\b", q_upper):
-            found.add(product)
-    return list(found)
-
-def map_question_to_client_type(question):
-    found = set()
-    q_upper = question.upper()
-    client_types = ['ALL', 'CORPORATES', 'FI', 'FINANCIAL INSTITUTION', 'PAYTECH']
-    for client_type in client_types:
-        if re.search(rf"\b{re.escape(client_type)}\b", q_upper):
-            found.add(client_type)
-    return list(found)
-
-def map_question_to_s2b(question):
-    found = set()
-    s2b_ls = ['S2B', 'STRAIGHT2BANK']
-    q_upper = question.upper()
-    for word in s2b_ls:
-        if re.search(rf"\b{re.escape(word)}\b", q_upper):
-            found.add(word)
-    return list(found)
-
-def process_question(session_id: str, question:str):
-    fd = get_filter_dict(session_id)
-    
-    extracted_countries = map_question_to_countries(question)
-    extracted_region = map_question_to_region(question)
-    extracted_indirect_countries = map_unofficialregion_to_countries(question)
-    extracted_products = map_question_to_product(question)
-    extracted_client_types = map_question_to_client_type(question)
-    extracted_s2b = map_question_to_s2b(question)
-    if extracted_region and extracted_countries:
-        extracted_indirect_countries = []
-    if extracted_indirect_countries:
-        question += ", ".join(extracted_indirect_countries)
-    parsed_country = list(set(extracted_countries + extracted_indirect_countries))
-
-    extend_unique(fd, "country", parsed_country)
-    extend_unique(fd, "region", extracted_region)
-    extend_unique(fd, "product", extracted_products)
-    extend_unique(fd, "client_type", extracted_client_types)
-    extend_unique(fd, "topic", extracted_s2b)
-    
-    return fd, question
-    # return parsed_country, extracted_region, question
+    main()
