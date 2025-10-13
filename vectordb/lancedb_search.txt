@@ -1,3 +1,43 @@
+# Replace this section in semantic_search_with_penalties function:
+
+def build_filter_string(filters: Dict[str, Any]) -> Optional[str]:
+    """Build SQL-like filter string for LanceDB"""
+    if not filters:
+        return None
+    
+    clauses = []
+    for key, values in filters.items():
+        if not values or values == 'ALL':
+            continue
+            
+        if isinstance(values, list):
+            # Filter out 'ALL' values
+            valid_values = [v for v in values if v and v != 'ALL']
+            if not valid_values:
+                continue
+            elif len(valid_values) == 1:
+                clauses.append(f"{key} = '{valid_values[0]}'")
+            else:
+                values_str = "', '".join(valid_values)
+                clauses.append(f"{key} IN ('{values_str}')")
+        else:
+            if values != 'ALL':
+                clauses.append(f"{key} = '{values}'")
+    
+    return " AND ".join(clauses) if clauses else None
+
+# Then in semantic_search_with_penalties function, replace the problematic lines with:
+
+# Build filter string for initial retrieval (optional)
+filter_string = build_filter_string(filters) if filters else None
+
+# Get candidates
+search_query = table.search(qvec).metric("cosine").limit(candidate_limit)
+if filter_string:
+    search_query = search_query.where(filter_string)
+
+candidates_df = search_query.to_pandas()
+###########################################
 """
 Corrected Semantic-First Progressive Filter System
 Respects extracted metadata filters and only adjusts for negations
