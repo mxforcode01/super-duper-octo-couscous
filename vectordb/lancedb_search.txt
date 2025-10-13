@@ -780,3 +780,512 @@ if __name__ == "__main__":
     )
     
     print("\n✅ Advanced progressive filter system ready!")
+
+#################################################################
+##################################################################
+"""
+LanceDB Semantic-First Progressive Filter System
+Prioritizes query similarity over metadata filters
+"""
+
+import lancedb
+import pandas as pd
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from typing import Any, Dict, Optional, List, Tuple
+import time
+import re
+
+# Initialize model
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# ========================================
+# SEMANTIC ANALYSIS
+# ========================================
+
+class QueryIntentAnalyzer:
+    """Analyzes query intent for negative conditions and semantic meaning"""
+    
+    def __init__(self):
+        self.negative_patterns = [
+            r'without\s+(\w+)',
+            r'exclude\s+(\w+)',
+            r'excluding\s+(\w+)',
+            r'except\s+(\w+)',
+            r'not\s+(?:in\s+)?(\w+)',
+            r'no\s+(\w+)',
+            r'avoid\s+(\w+)',
+            r'skip\s+(\w+)',
+        ]
+        
+        # Common countries/regions for entity recognition
+        self.countries = {
+            'singapore', 'malaysia', 'thailand', 'indonesia', 'philippines',
+            'vietnam', 'bangladesh', 'india', 'china', 'japan', 'korea',
+            'usa', 'uk', 'germany', 'france', 'australia'
+        }
+        
+        self.regions = {'asia', 'europe', 'americas', 'africa', 'apac', 'emea'}
+        self.products = {'cash', 'fx', 'securities', 'trade', 'treasury'}
+        self.topics = {'s2b', 'ach', 'rtgs', 'swift', 'wire', 'sepa'}
+    
+    def extract_negations(self, query: str) -> Dict[str, List[str]]:
+        """Extract negative conditions from query"""
+        query_lower = query.lower()
+        negations = {
+            'countries': [],
+            'regions': [],
+            'products': [],
+            'topics': [],
+            'general': []
+        }
+        
+        for pattern in self.negative_patterns:
+            matches = re.findall(pattern, query_lower)
+            for match in matches:
+                # Categorize the negation
+                if match in self.countries:
+                    negations['countries'].append(match.upper())
+                elif match in self.regions:
+                    negations['regions'].append(match.upper())
+                elif match in self.products:
+                    negations['products'].append(match.upper())
+                elif match in self.topics:
+                    negations['topics'].append(match.upper())
+                else:
+                    negations['general'].append(match)
+        
+        return negations
+    
+    def should_override_filter(self, query: str, filter_key: str, filter_value: Any) -> bool:
+        """
+        Determine if a filter should be overridden based on query semantics
+        
+        Returns True if the filter contradicts the query intent
+        """
+        negations = self.extract_negations(query)
+        
+        # Check if filter value is in negations
+        if filter_key == 'country' and filter_value:
+            if isinstance(filter_value, str):
+                return filter_value.upper() in [n.upper() for n in negations['countries']]
+            elif isinstance(filter_value, list):
+                return any(v.upper() in [n.upper() for n in negations['countries']] 
+                          for v in filter_value)
+        
+        # Similar checks for other filter types
+        if filter_key == 'region' and filter_value:
+            if isinstance(filter_value, str):
+                return filter_value.upper() in [n.upper() for n in negations['regions']]
+        
+        return False
+
+# ========================================
+# SEMANTIC-AWARE SEARCH
+# ========================================
+
+def semantic_priority_search(
+    table,
+    model,
+    query_text: str,
+    filters: Dict[str, Any],
+    limit: int = 20,
+    semantic_threshold: float = 0.7,
+    use_two_stage: bool = True,
+    verbose: bool = False
+) -> Tuple[pd.DataFrame, int, Dict]:
+    """
+    Two-stage search that prioritizes semantic similarity
+    
+    Stage 1: Get top candidates by pure similarity (no filters)
+    Stage 2: Apply filters as soft constraints with scoring adjustment
+    """
+    
+    analyzer = QueryIntentAnalyzer()
+    negations = analyzer.extract_negations(query_text)
+    
+    # Encode query
+    qvec = model.encode(query_text)
+    qvec = qvec / np.linalg.norm(qvec)
+    
+    if use_two_stage:
+        # Stage 1: Get more candidates than needed without filters
+        candidate_limit = limit * 5  # Get 5x candidates
+        
+        if verbose:
+            print(f"\n📊 Stage 1: Semantic search for {candidate_limit} candidates")
+            print(f"   Negations detected: {negations}")
+        
+        candidates_df = (
+            table.search(qvec)
+            .metric("cosine")
+            .limit(candidate_limit)
+            .to_pandas()
+        )
+        
+        if len(candidates_df) == 0:
+            return pd.DataFrame(), 0, {'negations': negations}
+        
+        # Calculate semantic scores (convert distance to similarity)
+        candidates_df['semantic_score'] = 1 - candidates_df['_distance']
+        
+        # Stage 2: Score adjustment based on filters and negations
+        if verbose:
+            print(f"\n📊 Stage 2: Applying smart filtering")
+        
+        # Apply positive filters as soft constraints
+        candidates_df['filter_score'] = 1.0
+        
+        for key, value in filters.items():
+            if value and not analyzer.should_override_filter(query_text, key, value):
+                # Apply filter as scoring factor
+                if isinstance(value, list):
+                    matches = candidates_df[key].isin(value)
+                else:
+                    matches = candidates_df[key] == value
+                
+                # Boost score for matches, penalize non-matches
+                candidates_df.loc[matches, 'filter_score'] *= 1.2
+                candidates_df.loc[~matches, 'filter_score'] *= 0.8
+        
+        # Apply negation penalties
+        for country in negations['countries']:
+            mask = candidates_df['country'].str.upper() == country.upper()
+            candidates_df.loc[mask, 'filter_score'] *= 0.3  # Heavy penalty
+            
+        for region in negations['regions']:
+            mask = candidates_df['region'].str.upper() == region.upper()
+            candidates_df.loc[mask, 'filter_score'] *= 0.3
+        
+        # Combine scores (semantic takes priority)
+        candidates_df['final_score'] = (
+            candidates_df['semantic_score'] * semantic_threshold +
+            candidates_df['filter_score'] * (1 - semantic_threshold)
+        )
+        
+        # Sort by final score and limit
+        results_df = candidates_df.nlargest(limit, 'final_score')
+        
+        if verbose:
+            print(f"   Results after smart filtering: {len(results_df)}")
+            print(f"   Top result score: semantic={results_df.iloc[0]['semantic_score']:.3f}, "
+                  f"filter={results_df.iloc[0]['filter_score']:.3f}, "
+                  f"final={results_df.iloc[0]['final_score']:.3f}")
+        
+        return results_df, len(results_df), {'negations': negations}
+    
+    else:
+        # Fallback: Traditional filter-based search
+        from lancedb_advanced_progressive_filter import build_filter_string, drop_all_values
+        
+        clean_filters = drop_all_values(filters)
+        filter_string = build_filter_string(clean_filters)
+        
+        search_query = table.search(qvec).metric("cosine")
+        if filter_string:
+            search_query = search_query.where(filter_string)
+        
+        results_df = search_query.limit(limit).to_pandas()
+        return results_df, len(results_df), {'negations': negations}
+
+# ========================================
+# PROGRESSIVE SEARCH WITH SEMANTIC PRIORITY
+# ========================================
+
+def progressive_semantic_search(
+    table,
+    model,
+    query_text: str,
+    initial_filters: Dict[str, Any],
+    max_results: int = 20,
+    filter_priority: Dict[str, int] = None,
+    semantic_threshold: float = 0.7,
+    min_semantic_score: float = 0.3,
+    verbose: bool = True
+) -> Dict:
+    """
+    Progressive filter relaxation with semantic priority
+    
+    Key improvements:
+    1. Detects negative conditions in query
+    2. Overrides filters that contradict query intent
+    3. Uses two-stage retrieval to prioritize semantics
+    4. Applies filters as soft constraints
+    """
+    
+    start_time = time.time()
+    analyzer = QueryIntentAnalyzer()
+    
+    # Default priority
+    if filter_priority is None:
+        filter_priority = {
+            "topic": 1,
+            "product": 2,
+            "client_type": 3,
+            "region": 4,
+            "country": 5
+        }
+    
+    # Analyze query for negations
+    negations = analyzer.extract_negations(query_text)
+    
+    # Clean filters and check for contradictions
+    active_filters = {}
+    overridden_filters = {}
+    
+    for key, value in initial_filters.items():
+        if value and value != 'ALL':
+            if analyzer.should_override_filter(query_text, key, value):
+                overridden_filters[key] = value
+                if verbose:
+                    print(f"⚠️ Overriding filter {key}={value} due to query negation")
+            else:
+                active_filters[key] = value
+    
+    if verbose:
+        print("\n" + "="*60)
+        print("🔍 SEMANTIC-FIRST PROGRESSIVE SEARCH")
+        print("="*60)
+        print(f"Query: '{query_text}'")
+        print(f"Detected negations: {negations}")
+        print(f"Initial filters: {initial_filters}")
+        print(f"Active filters: {active_filters}")
+        print(f"Overridden filters: {overridden_filters}")
+        print(f"Semantic threshold: {semantic_threshold}")
+        print("-"*60)
+    
+    iterations = 0
+    removed_filters = []
+    search_history = []
+    
+    # Try with current filters
+    while True:
+        iterations += 1
+        
+        # Perform semantic-priority search
+        results_df, count, metadata = semantic_priority_search(
+            table, model, query_text, active_filters,
+            limit=max_results, 
+            semantic_threshold=semantic_threshold,
+            use_two_stage=True,
+            verbose=verbose and iterations == 1
+        )
+        
+        search_history.append({
+            'iteration': iterations,
+            'filters': active_filters.copy(),
+            'count': count
+        })
+        
+        if verbose:
+            print(f"\n📊 Iteration {iterations}: ")
+            print(f"   Active filters: {list(active_filters.keys()) if active_filters else 'None'}")
+            print(f"   Results found: {count}")
+            if count > 0 and 'semantic_score' in results_df.columns:
+                avg_semantic = results_df['semantic_score'].mean()
+                print(f"   Avg semantic score: {avg_semantic:.3f}")
+        
+        # Check termination conditions
+        if count >= max_results:
+            if verbose:
+                print(f"\n✅ Target reached with {count} results")
+            break
+        
+        if not active_filters:
+            if verbose:
+                print(f"\n⚠️ All filters removed. Returning {count} results")
+            break
+        
+        # Remove lowest priority filter
+        if active_filters:
+            filters_by_priority = sorted(
+                active_filters.items(),
+                key=lambda x: filter_priority.get(x[0], 999)
+            )
+            
+            if filters_by_priority:
+                key_to_remove, value_removed = filters_by_priority[0]
+                del active_filters[key_to_remove]
+                removed_filters.append({'key': key_to_remove, 'value': value_removed})
+                
+                if verbose:
+                    print(f"   → Removing filter: {key_to_remove}={value_removed}")
+        else:
+            break
+    
+    # Filter results by minimum semantic score
+    if count > 0 and 'semantic_score' in results_df.columns:
+        results_df = results_df[results_df['semantic_score'] >= min_semantic_score]
+        if verbose and len(results_df) < count:
+            print(f"\n📝 Filtered {count - len(results_df)} results below semantic threshold {min_semantic_score}")
+    
+    execution_time = time.time() - start_time
+    
+    if verbose:
+        print("\n" + "="*60)
+        print("📈 SEARCH SUMMARY")
+        print("="*60)
+        print(f"✓ Final result count: {len(results_df)}")
+        print(f"✓ Query negations: {negations}")
+        print(f"✓ Overridden filters: {list(overridden_filters.keys())}")
+        print(f"✓ Applied filters: {active_filters if active_filters else 'None'}")
+        print(f"✓ Removed filters: {[r['key'] for r in removed_filters]}")
+        print(f"✓ Iterations: {iterations}")
+        print(f"✓ Execution time: {execution_time:.3f}s")
+    
+    return {
+        'results': results_df,
+        'applied_filters': active_filters,
+        'removed_filters': removed_filters,
+        'overridden_filters': overridden_filters,
+        'negations': negations,
+        'iterations': iterations,
+        'execution_time': execution_time
+    }
+
+# ========================================
+# TESTING
+# ========================================
+
+def setup_test_database_with_countries():
+    """Setup test database with country-specific data"""
+    
+    documents = [
+        {
+            'text': 'S2B payment services available in Singapore for corporate clients',
+            'region': 'ASIA', 'country': 'SINGAPORE', 'topic': 'S2B',
+            'product': 'CASH', 'client_type': 'CORPORATES'
+        },
+        {
+            'text': 'S2B implementation across all Asian countries including Bangladesh',
+            'region': 'ASIA', 'country': 'BANGLADESH', 'topic': 'S2B',
+            'product': 'CASH', 'client_type': 'CORPORATES'
+        },
+        {
+            'text': 'S2B payment network for Malaysia Thailand and Indonesia',
+            'region': 'ASIA', 'country': 'MALAYSIA', 'topic': 'S2B',
+            'product': 'CASH', 'client_type': 'CORPORATES'
+        },
+        {
+            'text': 'ACH system implementation in Bangladesh for retail banking',
+            'region': 'ASIA', 'country': 'BANGLADESH', 'topic': 'ACH',
+            'product': 'CASH', 'client_type': 'RETAIL'
+        },
+        {
+            'text': 'SWIFT network connecting Asian markets excluding certain countries',
+            'region': 'ASIA', 'country': 'ALL', 'topic': 'SWIFT',
+            'product': 'FX', 'client_type': 'ALL'
+        },
+        {
+            'text': 'S2B corporate solutions for APAC region without Bangladesh market',
+            'region': 'ASIA', 'country': 'ALL', 'topic': 'S2B',
+            'product': 'CASH', 'client_type': 'CORPORATES'
+        },
+    ]
+    
+    # Setup LanceDB
+    db = lancedb.connect("./lancedb_semantic")
+    
+    # Prepare data
+    data = []
+    for i, doc in enumerate(documents):
+        vec = model.encode(doc['text'])
+        vec = vec / np.linalg.norm(vec)
+        record = {
+            'id': i,
+            'text': doc['text'],
+            'vector': vec,
+            **{k: v for k, v in doc.items() if k != 'text'}
+        }
+        data.append(record)
+    
+    # Create table
+    table_name = "documents"
+    if table_name in db.table_names():
+        db.drop_table(table_name)
+    
+    df = pd.DataFrame(data)
+    table = db.create_table(table_name, df)
+    
+    print(f"✅ Created table with {len(data)} documents")
+    return table
+
+if __name__ == "__main__":
+    # Setup database
+    table = setup_test_database_with_countries()
+    
+    # Test 1: Query with negative condition
+    print("\n" + "🚀"*30)
+    print("TEST 1: Query with Negative Condition")
+    print("🚀"*30)
+    
+    # The query asks for S2B WITHOUT Bangladesh
+    # But the filter might extract Bangladesh as country
+    query1 = "S2B payment capability without Bangladesh"
+    filters1 = {
+        'country': 'BANGLADESH',  # This contradicts the query!
+        'topic': 'S2B',
+        'client_type': 'CORPORATES'
+    }
+    
+    result1 = progressive_semantic_search(
+        table, model,
+        query_text=query1,
+        initial_filters=filters1,
+        max_results=5,
+        semantic_threshold=0.7,  # 70% weight to semantic similarity
+        verbose=True
+    )
+    
+    print("\n🔍 Results:")
+    if not result1['results'].empty:
+        for idx, row in result1['results'].head().iterrows():
+            print(f"\n📄 Result {idx+1}:")
+            print(f"   Text: {row['text'][:80]}...")
+            print(f"   Country: {row['country']}")
+            if 'semantic_score' in row:
+                print(f"   Semantic score: {row['semantic_score']:.3f}")
+            if 'final_score' in row:
+                print(f"   Final score: {row['final_score']:.3f}")
+    
+    # Test 2: Query asking for exclusion
+    print("\n" + "🚀"*30)
+    print("TEST 2: Query with Multiple Exclusions")
+    print("🚀"*30)
+    
+    query2 = "Asian payment systems excluding Bangladesh and India"
+    filters2 = {
+        'region': 'ASIA',
+        'topic': 'S2B'
+    }
+    
+    result2 = progressive_semantic_search(
+        table, model,
+        query_text=query2,
+        initial_filters=filters2,
+        max_results=5,
+        semantic_threshold=0.75,
+        verbose=True
+    )
+    
+    # Test 3: Positive query matching filter
+    print("\n" + "🚀"*30)
+    print("TEST 3: Positive Query (Filter Aligned)")
+    print("🚀"*30)
+    
+    query3 = "S2B payment in Singapore"
+    filters3 = {
+        'country': 'SINGAPORE',
+        'topic': 'S2B'
+    }
+    
+    result3 = progressive_semantic_search(
+        table, model,
+        query_text=query3,
+        initial_filters=filters3,
+        max_results=3,
+        semantic_threshold=0.6,
+        verbose=True
+    )
+    
+    print("\n✅ Semantic-first progressive search complete!")
