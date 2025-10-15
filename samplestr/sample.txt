@@ -1,0 +1,113 @@
+import streamlit as st
+from main import *
+from css import SEARCH_STYLES
+import time
+import io
+
+def human_like_response(response, processing_time_str):
+    for word in response.split(" "):
+        yield word + " "
+        time.sleep(0.03)
+    yield processing_time_str
+
+
+# Streamed response emulator
+def response_generator(session_state, user_qn):
+    start_time = time.time()
+    context_strings, references = send_to_backend(session_state, user_qn)
+    response = get_answer(user_qn, context_strings)
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    elapsed_time = f'{elapsed_time:.1f}'
+    processing_time_str = f"  \n:blue[Processing Time:{elapsed_time}s]"
+
+    return response, processing_time_str, references
+
+def _render_refs(refs):
+    # can put this into table
+    if not refs:
+        st.caption("No references yet.")
+        return
+    # Accept dicts like {"filename":..., "url":..., "paragraph":...}
+    reference_df = pd.DataFrame(refs)
+    reference_df['Filename'] = reference_df.apply(lambda x: f'<a href="{x["url"]}" target="_blank">{x["filename"]}</a>', axis = 1)
+    st.markdown(
+        """
+        <style>
+        table td {
+            text-align: left !important;
+        }
+        table th {
+            text-align: left !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    st.markdown(reference_df[['Filename', 'Updated Date']].to_html(escape=False, index=False), unsafe_allow_html=True)
+
+def show():
+    st.markdown(SEARCH_STYLES, unsafe_allow_html=True)
+
+    st.markdown(
+        """
+        <div class="top-bar">
+            <div class = "top-bar-left">TB Sales</div>
+            <div class = "top-bar-right">
+                <a href="#">Content Library</a>
+                <a href="#">FAQ</a>
+                <a href="#" class = "custom-button">Home</a>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    st.title("Search Content :mag_right:")
+    st.write("Ask questions related to products and services")
+
+    # Initialize chat history
+    if "qamessages" not in st.session_state:
+        st.session_state.qamessages = []
+    if "qasources" not in st.session_state:
+        st.session_state.qasources = ["All"]
+    if "qaprompt" not in st.session_state:
+        st.session_state.qaprompt = ""
+
+    if "user_input" not in st.session_state:
+        st.session_state.user_input = dict()
+
+    st.session_state.user_input['region'] = "ALL"
+    st.session_state.user_input['country'] = "ALL"
+
+    # Display chat messages from history on app rerun
+    for message in st.session_state.qamessages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    sources = ['All']
+    # Accept user input
+    if prompt := st.chat_input("Ask me"):
+        # Add user message to chat history
+        st.session_state.qamessages.append({"role": "user", "content": prompt})
+        # Display user message in chat message container
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Display assistant response in chat message container
+
+        with st.chat_message("assistant"):
+            with st.spinner('Processing...'):
+                if len(sources) == 0:
+                    sources = ['All']
+
+                st.session_state.qasources = sources
+                st.session_state.qaprompt = prompt
+
+                response, processing_time_str, context_ls = response_generator(st.session_state, prompt)
+                response_to_display = st.write_stream(human_like_response(response, processing_time_str))
+                with st.expander("See sources"):
+                    _render_refs(context_ls)
+
+            response += processing_time_str
+        # Add assistant response to chat history
+        st.session_state.qamessages.append({"role": "assistant", "content": response})
