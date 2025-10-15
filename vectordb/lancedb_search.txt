@@ -167,13 +167,6 @@ def map_question_to_client_type(question):
     client_types = ['ALL', 'CORPORATES', 'FI', 'FINANCIAL INSTITUTION', 'PAYTECH', 'RETAIL', 'INSTITUTIONAL']
     
     client_map = {
-        'FINANCIAL INSTITUTION': 'FI',
-        'FI': 'FI',
-        'CORPORATES': 'CORPORATES',
-        'CORPORATE': 'CORPORATES',
-        'RETAIL': 'RETAIL',
-        'INSTITUTIONAL': 'INSTITUTIONAL',
-        'PAYTECH': 'PAYTECH'
     }
     
     for client_type in client_types:
@@ -187,15 +180,6 @@ def map_question_to_topic(question):
     q_upper = question.upper()
     
     topic_patterns = {
-        'S2B': ['S2B', 'STRAIGHT2BANK', 'STRAIGHT 2 BANK'],
-        'ACH': ['ACH', 'AUTOMATED CLEARING HOUSE'],
-        'RTGS': ['RTGS', 'REAL TIME GROSS SETTLEMENT'],
-        'SWIFT': ['SWIFT'],
-        'WIRE': ['WIRE', 'WIRE TRANSFER'],
-        'SEPA': ['SEPA'],
-        'FAST': ['FAST', 'FAST PAYMENT'],
-        'GIRO': ['GIRO'],
-        'MEPS': ['MEPS'],
     }
     
     for standard_topic, variations in topic_patterns.items():
@@ -319,13 +303,13 @@ class NegationAnalyzer:
                 entities['products'].add(product)
         
         # Check for topics
-        topics = ['S2B', 'ACH', 'RTGS', 'SWIFT', 'WIRE', 'SEPA']
+        topics = []
         for topic in topics:
             if re.search(rf"\b{re.escape(topic)}\b", text_upper):
                 entities['topics'].add(topic)
         
         # Check for client types
-        client_types = ['CORPORATES', 'FI', 'RETAIL', 'INSTITUTIONAL']
+        client_types = []
         for client_type in client_types:
             if re.search(rf"\b{re.escape(client_type)}\b", text_upper):
                 entities['client_types'].add(client_type)
@@ -640,34 +624,7 @@ def main():
     db = lancedb.connect("./lancedb_corrected")
     
     documents = [
-        {
-            'text': 'ACH payment cut-off time for Bangladesh is 3:00 PM local time',
-            'metadata': {
-                'region': 'ASIA', 'country': 'BANGLADESH', 'topic': 'ACH',
-                'product': 'CASH', 'client_type': 'CORPORATES'
-            }
-        },
-        {
-            'text': 'S2B payment services available in Singapore for corporate clients',
-            'metadata': {
-                'region': 'ASIA', 'country': 'SINGAPORE', 'topic': 'S2B',
-                'product': 'CASH', 'client_type': 'CORPORATES'
-            }
-        },
-        {
-            'text': 'Cut-off times for Malaysia ACH payments are 4:00 PM',
-            'metadata': {
-                'region': 'ASIA', 'country': 'MALAYSIA', 'topic': 'ACH',
-                'product': 'CASH', 'client_type': 'RETAIL'
-            }
-        },
-        {
-            'text': 'S2B implementation for all Asian countries except Bangladesh',
-            'metadata': {
-                'region': 'ASIA', 'country': 'ALL', 'topic': 'S2B',
-                'product': 'CASH', 'client_type': 'CORPORATES'
-            }
-        }
+       
     ]
     
     # Create table
@@ -696,7 +653,7 @@ def main():
     
     session_id = "test1"
     reset_filter_dict(session_id)
-    query1 = "What is the cut off time for Bangladesh?"
+    query1 = ""
     
     result1 = integrated_semantic_search(
         table, model, session_id, query1,
@@ -718,7 +675,7 @@ def main():
     
     session_id = "test2"
     reset_filter_dict(session_id)
-    query2 = "S2B payment capability without Bangladesh"
+    query2 = ""
     
     result2 = integrated_semantic_search(
         table, model, session_id, query2,
