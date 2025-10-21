@@ -1,0 +1,78 @@
+import streamlit as st
+
+st.set_page_config(page_title="My App", layout="wide")
+
+# Step 1: Create the blue background FIRST using HTML
+st.markdown("""
+    <div style="background-color: #C6DCF0; 
+                margin: -80px -100px 0 -100px; 
+                padding: 80px 100px 40px 100px;
+                position: relative;
+                z-index: 0;">
+    </div>
+""", unsafe_allow_html=True)
+
+# Step 2: Use CSS to pull the Streamlit button UP into the blue area
+st.markdown("""
+    <style>
+        header, footer {visibility: hidden;}
+         .block-container {
+            padding-top: 2rem;
+        }
+        /* Move the next element (our button) up into the blue box */
+        div[data-testid="stVerticalBlock"] > div:nth-child(2) {
+            margin-top: -110px !important;
+            position: relative;
+            z-index: 1;
+            padding: 20px;
+        }
+            
+        /* Style for FAQ link */
+        .faq-link {
+            color: #333;
+            text-decoration: none;
+            padding: 10px 16px;
+            border-radius: 5px;
+            font-size: 16px;
+            transition: all 0.3s ease;
+            display: inline-block;
+        }
+        
+        .faq-link:hover {
+            background-color: rgba(255, 255, 255, 0.5);
+            color: #2D5BE3;
+            text-decoration: none;
+        }
+        
+        /* Style the button */
+        .stButton > button {
+            background-color: #2D5BE3;
+            color: white;
+            border: none;
+            padding: 10px 24px;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+        
+        .stButton > button:hover {
+            background-color: #1e3a8a;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+# Step 3: Create the Streamlit button (it will be pulled up into the blue area)
+col1, col2, col3, col4 = st.columns([2, 6,0.5, 1])
+
+with col1:
+    st.image("https://via.placeholder.com/150x50/4CAF50/FFFFFF?text=Logo", width=150)
+
+with col3:
+    st.markdown('<a href="#faq-section" class="faq-link">FAQ</a>', unsafe_allow_html=True)
+    
+with col4:
+    if st.button("Back"):
+        st.success("Button clicked! It works!")
+
+# Main content
+st.title("Welcome to My App")
+st.write("This is the main content area.")
