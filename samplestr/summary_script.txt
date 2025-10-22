@@ -1,0 +1,293 @@
+import lancedb, hashlib, numpy as np, pandas as pd
+from typing import List, Dict, Optional
+from sentence_transformers import SentenceTransformer
+
+DB_PATH = "/path/to/lancedb"
+TABLE = "executive_summary_chunks"
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+db = lancedb.connect(DB_PATH)
+table = db.open_table(TABLE)
+
+def chunk_text(text: str, max_len: int = 320) -> List[str]:
+    import re
+    sents = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunks, cur = [], ""
+    for s in sents:
+        if len(cur) + len(s) <= max_len: cur = (cur + " " + s).strip()
+        else: 
+            if cur: chunks.append(cur)
+            cur = s
+    if cur: chunks.append(cur)
+    return [c for c in chunks if len(c) > 20]
+
+def build_where(meta: Dict[str, List[str]]) -> Optional[str]:
+    clauses=[]
+    for k, vals in meta.items():
+        if not vals or all(str(v).upper()=="ALL" for v in vals): continue
+        safe = ", ".join([f"'{str(v)}'" for v in vals])
+        clauses.append(f"{k} IN [{safe}]")
+    return " AND ".join(clauses) if clauses else None
+
+def _hash_text(t:str)->str: 
+    import hashlib; return hashlib.sha1(t.encode("utf-8")).hexdigest()
+
+def select_diverse_queries(queries: List[str], keep:int=12) -> List[str]:
+    """Greedy farthest-point selection for diversity."""
+    if len(queries) <= keep: return queries
+    X = embedder.encode(queries, normalize_embeddings=True)
+    # start from the most 'central' query (closest to centroid)
+    centroid = X.mean(0); d = np.linalg.norm(X - centroid, axis=1)
+    start = int(np.argmin(d))
+    sel = [start]; dist = np.linalg.norm(X - X[start], axis=1)
+    while len(sel) < keep:
+        nxt = int(np.argmax(dist))
+        sel.append(nxt)
+        dist = np.minimum(dist, np.linalg.norm(X - X[nxt], axis=1))
+    return [queries[i] for i in sel]
+
+def lancedb_search_round_robin(
+    client_objectives: str,
+    solution_overview: str,
+    metadata: Dict[str, List[str]],
+    final_k: int = 20,
+    per_query_cap: int = 2,         # hits per query per round
+    rounds: int = 2,                # number of round-robin passes
+    max_queries_scanned: Optional[int] = 12,  # pre-trim long inputs
+    use_diverse_query_selection: bool = True,
+    relax_order: List[str] = None
+) -> pd.DataFrame:
+    if relax_order is None:
+        relax_order = ["product", "client_type", "region", "country"]
+
+    combined = f"{client_objectives.strip()} {solution_overview.strip()}".strip()
+    queries = chunk_text(combined)
+
+    # Optional query selection for very long inputs
+    if use_diverse_query_selection:
+        queries = select_diverse_queries(queries, keep=max_queries_scanned or 12)
+    elif max_queries_scanned:
+        queries = queries[:max_queries_scanned]
+
+    def run_once(meta: Dict[str, List[str]]) -> pd.DataFrame:
+        where_expr = build_where(meta)
+        seen, rows = set(), []
+        # precompute embeddings for efficiency
+        Q = [(i, q, embedder.encode(q)) for i, q in enumerate(queries)]
+        for r in range(rounds):                 # round-robin passes
+            for qi, q, qvec in Q:
+                if len(rows) >= final_k: break  # global early stop
+                remaining = final_k - len(rows)
+                cap = min(per_query_cap, remaining)
+                qres = table.search(qvec).where(where_expr).limit(cap).to_df() if where_expr \
+                       else table.search(qvec).limit(cap).to_df()
+                if qres is None or qres.empty: 
+                    continue
+                qres["query_text"] = q; qres["query_idx"] = qi; 
+                if "id" not in qres.columns: qres["id"] = qres["text"].apply(_hash_text)
+                for _, rec in qres.iterrows():
+                    if rec["id"] in seen: continue
+                    seen.add(rec["id"]); rows.append(rec)
+                    if len(rows) >= final_k: break
+            if len(rows) >= final_k: break
+        if not rows: return pd.DataFrame()
+        out = pd.DataFrame(rows).sort_values("score", ascending=True)\
+                                .drop_duplicates(subset="text").head(final_k)
+        return out
+
+    # strict
+    out = run_once(metadata)
+    if len(out) >= final_k: return out
+
+    # relax progressively
+    relaxed = metadata.copy()
+    for key in relax_order:
+        if key in relaxed:
+            relaxed[key] = ["ALL"]
+            out = run_once(relaxed)
+            if len(out) >= final_k: return out
+
+##################################################
+import lancedb, hashlib
+import pandas as pd
+from typing import List, Dict, Optional
+from sentence_transformers import SentenceTransformer
+
+# ---- Init (adjust for your env) ----
+DB_PATH = "/path/to/lancedb"
+TABLE_NAME = "executive_summary_chunks"
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+db = lancedb.connect(DB_PATH)
+table = db.open_table(TABLE_NAME)
+
+# ---- Utilities ----
+def chunk_text(text: str, max_len: int = 320) -> List[str]:
+    import re
+    sents = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunks, cur = [], ""
+    for s in sents:
+        if len(cur) + len(s) <= max_len:
+            cur += (" " if cur else "") + s
+        else:
+            if cur: chunks.append(cur)
+            cur = s
+    if cur: chunks.append(cur)
+    # keep only non-trivial chunks
+    return [c.strip() for c in chunks if len(c.strip()) > 20]
+
+def build_metadata_filter(meta: Dict[str, List[str]]) -> Optional[str]:
+    """Turn meta dict into LanceDB where() expression. Skip 'ALL'."""
+    clauses = []
+    for k, vals in meta.items():
+        if not vals: continue
+        if all(str(v).upper() == "ALL" for v in vals):  # wildcard
+            continue
+        safe_vals = ", ".join([f"'{str(v)}'" for v in vals])
+        clauses.append(f"{k} IN [{safe_vals}]")
+    return " AND ".join(clauses) if clauses else None
+
+def _hash_text(t: str) -> str:
+    return hashlib.sha1(t.encode("utf-8")).hexdigest()
+
+# ---- Core search with global budget + per-query cap + early stop ----
+def lancedb_search_with_budget(
+    client_objectives: str,
+    solution_overview: str,
+    metadata: Dict[str, List[str]],
+    final_k: int = 20,
+    per_query_cap: int = 3,            # <=— your knob (2–4 is typical)
+    relax_order: List[str] = None      # optional progressive relaxation
+) -> pd.DataFrame:
+    """
+    Returns up to final_k unique hits. Stops early once budget is met.
+    Caps hits per sub-query to keep diversity.
+    Optionally relaxes filters if budget not met after all queries.
+    """
+    if relax_order is None:
+        relax_order = ["product", "client_type", "region", "country"]
+
+    combined = f"{client_objectives.strip()} {solution_overview.strip()}".strip()
+    queries = chunk_text(combined)
+
+    def _run_once(meta: Dict[str, List[str]]) -> pd.DataFrame:
+        where_expr = build_metadata_filter(meta)
+        seen_ids, rows = set(), []
+
+        for qi, q in enumerate(queries):
+            if len(rows) >= final_k:           # early stop
+                break
+            q_emb = embedder.encode(q)
+
+            # dynamic cap so late queries can still contribute if needed
+            remaining = final_k - len(rows)
+            cap = min(per_query_cap, remaining)
+
+            df = table.search(q_emb).where(where_expr).limit(cap).to_df() if where_expr \
+                 else table.search(q_emb).limit(cap).to_df()
+
+            if df is None or df.empty:
+                continue
+
+            # add query context and de-dup
+            df["query_text"] = q
+            df["query_idx"] = qi
+            if "id" not in df.columns:
+                df["id"] = df["text"].apply(_hash_text)
+
+            for _, r in df.iterrows():
+                rid = r["id"]
+                if rid in seen_ids:
+                    continue
+                seen_ids.add(rid)
+                rows.append(r)
+                if len(rows) >= final_k:
+                    break
+
+        if not rows:
+            return pd.DataFrame()
+        out = pd.DataFrame(rows)
+        # Lower score is better in LanceDB; keep best unique texts
+        out = out.sort_values("score", ascending=True).drop_duplicates(subset="text").head(final_k)
+        return out
+
+    # 1) strict filters
+    result = _run_once(metadata)
+    if len(result) >= final_k:
+        return result
+
+    # 2) progressive relaxation if needed
+    relaxed = metadata.copy()
+    for key in relax_order:
+        if key in relaxed:
+            relaxed[key] = ["ALL"]
+            result = _run_once(relaxed)
+            if len(result) >= final_k:
+                return result
+
+    # 3) return whatever we have
+    return result
+
+# ---- Example usage ----
+# meta = {"region":["ASIA"], "country":["SINGAPORE"], "client_type":["CORPORATES"], "product":["CASH"]}
+# df = lancedb_search_with_budget(client_obj, soln_overview, meta, final_k=20, per_query_cap=3)
+# print(df[["text","score","metadata","query_idx"]].head(10))
+#####################################################################
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ---------------------
+# MMR RERANK FUNCTION
+# ---------------------
+def mmr_rerank(query_emb, docs, doc_embs, top_k=10, lambda_mult=0.7):
+    """
+    Selects top_k docs using Maximal Marginal Relevance.
+    query_emb: np.array shape (dim,)
+    docs: list of document strings
+    doc_embs: np.array shape (n_docs, dim)
+    lambda_mult: trade-off parameter (0.5-0.9)
+    """
+    if len(docs) <= top_k:
+        return list(range(len(docs)))  # return all indices if small pool
+
+    sim_query = cosine_similarity(doc_embs, query_emb.reshape(1, -1)).flatten()
+    selected = [int(np.argmax(sim_query))]
+    candidates = set(range(len(docs))) - set(selected)
+
+    while len(selected) < top_k and candidates:
+        candidate_list = list(candidates)
+        sim_to_selected = cosine_similarity(
+            doc_embs[candidate_list],
+            doc_embs[selected]
+        )
+        max_sim_selected = np.max(sim_to_selected, axis=1)
+        mmr_score = (
+            lambda_mult * sim_query[candidate_list]
+            - (1 - lambda_mult) * max_sim_selected
+        )
+        next_idx = candidate_list[int(np.argmax(mmr_score))]
+        selected.append(next_idx)
+        candidates.remove(next_idx)
+
+    return selected
+
+results = lancedb_search_round_robin(
+    client_objectives, solution_overview, metadata,
+    final_k=20,  # ← get up to 20 raw hits
+    per_query_cap=2, rounds=2
+)
+
+# Only proceed if we got some hits
+if not results.empty:
+    doc_texts = results["text"].tolist()
+    doc_embs = embedder.encode(doc_texts, normalize_embeddings=True)
+    query_emb = embedder.encode(client_objectives + " " + solution_overview, normalize_embeddings=True)
+
+    selected_idx = mmr_rerank(query_emb, doc_texts, doc_embs, top_k=10, lambda_mult=0.7)
+    final_results = results.iloc[selected_idx].reset_index(drop=True)
+else:
+    final_results = results
+
+
+    return out
