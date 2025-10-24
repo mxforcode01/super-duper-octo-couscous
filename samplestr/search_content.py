@@ -1,6 +1,6 @@
 import streamlit as st
-from main import *
-from css import SEARCH_STYLES
+# from main import *
+# from css_rfp import SEARCH_STYLES
 import time
 import pandas as pd
 
@@ -21,11 +21,16 @@ def generate_ai_response(session_state, user_qn):
     """
     start_time = time.time()
     # Get context and references from backend
-    context_strings, references = send_to_backend(session_state, user_qn)
+    # context_strings, references = send_to_backend(session_state, user_qn)
     
     # Get AI answer
-    response = get_answer(user_qn, context_strings)
-    
+    # response = get_answer(user_qn, context_strings)
+    response = "This is a mock response to your query about '{}'.".format(user_qn)
+    references = [
+        {"filename": "Document1.pdf", "url": "http://example.com/doc1", "Updated Date": "2024-01-15"},
+        {"filename": "Document2.pdf", "url": "http://example.com/doc2", "Updated Date": "2024-02-20"}
+    ]
+
     # Calculate processing time
     end_time = time.time()
     elapsed_time = f'{end_time - start_time:.1f}'
@@ -132,13 +137,15 @@ def render_suggested_questions(suggestions, message_idx):
                     suggestion
                 )
                 
-                # Add AI response to chat history
-                full_response = response + time_str
+                # Add AI response to chat history with streaming flag
                 st.session_state.qamessages.append({
                     "role": "assistant",
-                    "content": full_response,
+                    "content": "",  # Empty initially
+                    "response": response,
+                    "time_str": time_str,
                     "references": refs,
-                    "suggestions": new_suggestions
+                    "suggestions": new_suggestions,
+                    "needs_streaming": True
                 })
             
             st.rerun()
@@ -241,13 +248,15 @@ def process_user_input(prompt):
             prompt
         )
         
-        # Add AI response to chat history
-        full_response = response + time_str
+        # Add AI response to chat history with streaming flag
         st.session_state.qamessages.append({
             "role": "assistant",
-            "content": full_response,
+            "content": "",  # Empty initially, will be filled during streaming
+            "response": response,  # Store the actual response
+            "time_str": time_str,  # Store the time string
             "references": refs,
-            "suggestions": suggestions
+            "suggestions": suggestions,
+            "needs_streaming": True  # Flag to indicate this message needs streaming
         })
     
     st.rerun()
@@ -259,15 +268,59 @@ def show():
     """Main function to render the search content page"""
     
     # Apply custom CSS
-    st.markdown(SEARCH_STYLES, unsafe_allow_html=True)
+    st.markdown("""
+        <style>
+        /* Suggested question buttons styling */
+        div[data-testid="stButton"] > button {
+            border: 2px solid #2563EB;
+            background-color: #FFFFFF;
+            color: #2563EB;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        
+        div[data-testid="stButton"] > button:hover {
+            background-color: #2563EB;
+            color: #FFFFFF;
+        }
+        
+        /* Back button specific styling */
+        div[data-testid="column"]:last-child div[data-testid="stButton"] > button {
+            border: 2px solid #DC2626;
+            background-color: #DC2626;
+            color: #FFFFFF;
+            font-weight: 600;
+        }
+        
+        div[data-testid="column"]:last-child div[data-testid="stButton"] > button:hover {
+            background-color: #B91C1C;
+            border-color: #B91C1C;
+        }
+        
+        /* Alternative approach for more specific targeting if needed */
+        button[kind="secondary"] {
+            border: 2px solid #2563EB;
+            background-color: #FFFFFF;
+            color: #2563EB;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    # st.markdown(SEARCH_STYLES, unsafe_allow_html=True)
     
     # Render header
-    render_header()
+    
     
     # Page title and description
-    st.title("Search Content 🔍")
-    st.write("Ask questions related to products and services")
-    
+    col2, col3 = st.columns([9,1])
+    # with col1:
+    #     st.title("Search Content 🔍")
+    #     st.write("Ask questions related to products and services")
+    with col3:
+        back_button = st.button("Back")
+        if back_button:
+            st.info("Clicked Back button - implement navigation logic here.")
+        
     # Initialize session state
     initialize_session_state()
     
@@ -278,16 +331,40 @@ def show():
     # Display chat history
     for idx, message in enumerate(st.session_state.qamessages):
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            
-            # Show references for assistant messages
-            if message["role"] == "assistant" and "references" in message:
-                with st.expander("📚 See sources", expanded=False):
-                    render_references(message["references"])
-            
-            # Show suggested questions for assistant messages
-            if message["role"] == "assistant" and "suggestions" in message:
-                render_suggested_questions(message["suggestions"], idx)
+            if message["role"] == "assistant" and message.get("needs_streaming", False):
+                # This is a new message that needs streaming
+                message_placeholder = st.empty()
+                
+                # Stream the response
+                full_response = ""
+                for chunk in human_like_response(message["response"], message["time_str"]):
+                    full_response += chunk
+                    message_placeholder.markdown(full_response)
+                
+                # Update the message content and remove the streaming flag
+                st.session_state.qamessages[idx]["content"] = full_response
+                st.session_state.qamessages[idx]["needs_streaming"] = False
+                
+                # Show references
+                if "references" in message:
+                    with st.expander("📚 See sources", expanded=False):
+                        render_references(message["references"])
+                
+                # Show suggested questions
+                if "suggestions" in message:
+                    render_suggested_questions(message["suggestions"], idx)
+            else:
+                # Display already streamed messages normally
+                st.markdown(message["content"])
+                
+                # Show references for assistant messages
+                if message["role"] == "assistant" and "references" in message:
+                    with st.expander("📚 See sources", expanded=False):
+                        render_references(message["references"])
+                
+                # Show suggested questions for assistant messages
+                if message["role"] == "assistant" and "suggestions" in message:
+                    render_suggested_questions(message["suggestions"], idx)
     
     # Chat input
     if prompt := st.chat_input("Ask me"):
