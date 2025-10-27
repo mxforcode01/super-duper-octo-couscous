@@ -1,0 +1,267 @@
+import streamlit as st
+import datetime
+import time
+import json
+from css import QA_STYLES
+from two_main import *
+from two_main_functions import *
+from two_main_es import *
+# -----------------------------
+# Page / global styles
+# -----------------------------
+
+# Tailwind-like utility CSS for quick styling (scoped)
+
+
+# -----------------------------
+# Demo data
+# -----------------------------
+
+# Helpers
+def human_like_response(message):
+    for word in message.split(" "):
+        yield word + " "
+        time.sleep(0.03)
+
+def push_message(qid: int, role: str, content: str, reference:list, **extra):
+    if qid not in st.session_state.threads:
+        st.session_state.threads[qid] = []
+    msg = {
+        "role": role,
+        "content": content,
+        "reference":reference,
+        "ts": datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    }
+    msg.update(extra)
+    st.session_state.threads[qid].append(msg)
+
+# def push_summary_message(role: str, content: str, **extra):
+#     msg = {
+#         "role": role,
+#         "content": content,
+#         "ts": datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+#     }
+#     msg.update(extra)
+#     st.session_state.summary_threads.append(msg)
+
+def open_chat(qid: int):
+    st.session_state.active_qid = qid
+    st.session_state.open_panel = True
+    st.session_state.summary_chat_open = False
+
+def initialize_answer():
+    for qa in st.session_state.question_dict:
+        if qa['id'] not in st.session_state.answers:
+            st.session_state.answers[qa['id']] = qa['body']
+
+def update_answer(qa_id):
+    st.session_state.answers[qa_id] = st.session_state[f"ans_{qa_id}"]
+
+def _render_refs(refs):
+    # can put this into table
+    if not refs:
+        st.caption("No references yet.")
+        return
+    # Accept dicts like {"filename":..., "url":..., "paragraph":...}
+    reference_df = pd.DataFrame(refs)
+    reference_df = reference_df[['filename', 'Updated Date', 'url']].drop_duplicates()
+    reference_df['Filename'] = reference_df.apply(lambda x: f'<a href="{x["url"]}" target="_blank">{x["filename"]}</a>', axis = 1)
+    st.markdown(
+        """
+        <style>
+        table td {
+            text-align: left !important;
+        }
+        table th {
+            text-align: left !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    st.markdown(reference_df[['Filename', 'Updated Date']].to_html(escape=False, index=False), unsafe_allow_html=True)
+
+
+
+@st.dialog("Export Doc - Confirmation")
+def confirm_export(word_doc):
+    st.markdown("""
+    **Please confirm that you have:**
+
+    - Reviewed all AI-assisted responses for **factual accuracy, completeness, and client suitability**.
+    - Acknowledge that **Generative AI may produce errors or omissions**, and that **you are responsible** for the final content.
+
+    """)
+
+    agree = st.checkbox("I have reviewed the items above and accept responsibility for the exported content.")
+    if agree:
+        st.session_state['rfp_attested'] = True
+
+    if st.session_state['rfp_attested']==True:
+        if st.download_button(
+            label="📥 Export",
+            data=word_doc,
+            file_name=f"Export.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            key="export",
+            use_container_width=True,
+        ):
+            st.session_state['rfp_attested'] = False
+            st.rerun()
+
+
+
+
+def show():
+    st.markdown(QA_STYLES, unsafe_allow_html=True)
+
+    initialize_answer()
+    # -----------------------------
+    # Main content
+    # -----------------------------
+
+    # Header with Export button
+    header_col1, header_col2, header_col3 = st.columns([8, 1, 0.75])
+
+    with header_col1:
+        st.markdown(
+            f"""
+            <div style="padding: 0;">
+                <div class="header-title">{st.session_state['user_input'].get("project_title", "")}</div>
+                <div class="header-subtitle">Client: {st.session_state['user_input'].get("client_name", "")}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    with header_col2:
+        if st.button("📥 Export"):
+            word_doc = export_text_to_word(st.session_state)
+            confirm_export(word_doc)
+    with header_col3:
+        if st.button("Back", "qa_back_button"):
+            st.session_state['current_page'] = "user_input_form"
+            st.rerun()
+
+    # Add some spacing after header
+    st.markdown("<div style='margin-bottom: 1rem;'></div>", unsafe_allow_html=True)
+
+    # Custom tab implementation with improved design
+    tab_col1,= st.tabs([f"Questions ({len(st.session_state.question_dict)})"])
+    # tab_col1, tab_col2, tab_spacer = st.columns([1.2, 1.2, 6])
+
+    with tab_col1:
+        # Add invisible marker for CSS targeting
+        st.markdown('<div class="tab-button-active" style="display:none;"></div>', unsafe_allow_html=True)
+
+    # Display content based on active tab
+    if st.session_state.active_tab == 0:
+        # Questions Tab Content
+        for qa in st.session_state.question_dict:
+            with st.container(border=True):
+                st.markdown('<div class="qa-card-sentinel"></div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="card-header"><span class="qdot">{qa["id"]}</span> '
+                    f'<span class="question-title">{qa["title"]}</span></div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Add marker for button styling
+                st.markdown('<div class="qa-buttons-container" style="display:none;"></div>', unsafe_allow_html=True)
+
+                col1, col2, col3 = st.columns([6, 1, 1])
+
+                with col2:
+                    if st.button("💬 Ask AI", key=f"chat_{qa['id']}", use_container_width=True):
+                        open_chat(qa["id"])
+                with col3:
+                    if st.button("✨ Rewrite", key=f"rephrase_{qa['id']}", use_container_width=True):
+                        current_answer = st.session_state.answers.get(qa['id'], qa['body'])
+                        rephrased_answer = rephrase_responses(qa['title'], current_answer)
+                        st.session_state.answers[qa['id']] = rephrased_answer
+                        st.rerun()
+
+
+                key = f"ans_{qa['id']}"
+                current_val = st.session_state.answers.get(qa["id"], qa['body'])
+                new_val = st.text_area(" ", value=current_val, key=key, label_visibility="collapsed", height=120, on_change=update_answer, args=(qa['id'],))
+                st.session_state.answers[qa["id"]] = new_val
+
+                # --- References UI (popover if available; otherwise expander) ---
+                # refs = st.session_state.references.get(qa["id"], [])
+                label = f"📚 References"
+
+                with st.expander(label, expanded=False):
+                    _render_refs(qa.get("refs", []))
+            # print(qa)
+    # -----------------------------
+    # Right-hand chat panel (Streamlit sidebar)
+    # -----------------------------
+    if st.session_state.open_panel:
+        with st.sidebar:
+            if not st.session_state.summary_chat_open:
+                # Original Questions Chat Panel
+                qid = st.session_state.active_qid
+                qa = next((q for q in st.session_state.question_dict if q["id"] == qid), None)
+
+                # Header
+                hleft, hright = st.columns([12,2])
+                with hleft:
+                    st.markdown('<div class="chat-title">AI Assistant</div>', unsafe_allow_html=True)
+                    if qa:
+                        st.markdown(
+                            f'<div class="muted" style="font-size:12px">Q{qa["id"]} — {qa["title"]}</div>',
+                            unsafe_allow_html=True,
+                        )
+                with hright:
+                    if st.button('✕', key='close_panel'):
+                        st.session_state.open_panel = False
+                        st.session_state.active_qid = None
+                        st.rerun()
+
+                st.divider()
+
+                # Chat container
+                chat_container = st.container(height=450)
+                with chat_container:
+                    thread = st.session_state.threads.get(qid, [])
+                    if not thread:
+                        with st.chat_message("assistant"):
+                            st.write("👋 Hi! How can I help you with this question?")
+                    else:
+                        for i, msg in enumerate(thread):
+                            with st.chat_message(msg["role"]):
+                                if (i == len(thread) - 1
+                                    and msg["role"] == "assistant"
+                                    and msg.get("stream", False)
+                                ):
+                                    st.write_stream(human_like_response(msg["content"]))
+                                    with st.expander("📚 References", expanded=False):
+                                        _render_refs(msg["reference"])
+                                    st.session_state.threads[qid][i]["stream"] = False
+                                    st.session_state.threads[qid][i]["reference"] = []
+                                else:
+                                    st.write(msg["content"])
+
+                # Input
+                prompt = st.chat_input("Type your message here...", key="chat_prompt")
+                if prompt:
+                    # Add user message and immediately rerun to show it
+                    push_message(qid, "user", prompt, [])
+                    st.rerun()
+
+                # Handle AI response separately - check if last message needs AI response
+                thread = st.session_state.threads.get(qid, [])
+                if thread and thread[-1]["role"] == "user" and not st.session_state.get("processing", False):
+                    # Set processing flag to prevent multiple responses
+                    st.session_state.processing = True
+
+                    with st.spinner("🤔 AI is finding information for you..."):
+                        qa = next((q for q in st.session_state.question_dict if q["id"] == qid), None)
+                        if qa:
+                            reply, references = get_chat_response(st.session_state, qa, thread[-1]["content"])
+                            push_message(qid, "assistant", reply, references, stream=True)
+
+                    # Reset processing flag
+                    st.session_state.processing = False
+                    st.rerun()
