@@ -1,5 +1,5 @@
 import streamlit as st
-import time
+from datetime import datetime, date
 
 # Page config
 st.set_page_config(
@@ -13,57 +13,28 @@ if 'messages' not in st.session_state:
     st.session_state.messages = []
     st.session_state.workflow_selected = False
     st.session_state.selected_workflow = None
-    st.session_state.file_upload_stage = False
-    st.session_state.uploaded_file = None
-    st.session_state.processing_complete = False
-    st.session_state.awaiting_instructions = False
+    st.session_state.dates_collected = False
+    st.session_state.data_date = None
+    st.session_state.replenishment_date = None
+    st.session_state.exclusion_file = None
+    st.session_state.update_method_selected = False
+    st.session_state.update_method = None
+    st.session_state.awaiting_chat_update = False
 
 # Title
-st.title("🤖 Workflow Assistant Chatbot")
+st.title("🤖 Workflow Assistant")
 
 # Function to add messages to chat
 def add_message(role, content):
     st.session_state.messages.append({"role": role, "content": content})
 
-# Function to process user instructions
-def process_user_instruction(instruction):
-    """Process user instructions after file upload"""
-    instruction_lower = instruction.lower()
-    
-    # Detect different types of instructions
-    if any(word in instruction_lower for word in ['analyze', 'analysis', 'examine', 'study']):
-        return f"📊 I'll analyze your file with focus on: {instruction}\n\nStarting analysis now..."
-    elif any(word in instruction_lower for word in ['summary', 'summarize', 'overview']):
-        return f"📋 I'll create a summary based on your request: {instruction}\n\nGenerating summary..."
-    elif any(word in instruction_lower for word in ['filter', 'select', 'find', 'search']):
-        return f"🔍 I'll filter the data according to: {instruction}\n\nApplying filters..."
-    elif any(word in instruction_lower for word in ['transform', 'convert', 'change', 'modify']):
-        return f"🔧 I'll transform the data as requested: {instruction}\n\nProcessing transformations..."
-    elif any(word in instruction_lower for word in ['visualize', 'plot', 'graph', 'chart']):
-        return f"📈 I'll create visualizations for: {instruction}\n\nGenerating visualizations..."
-    elif any(word in instruction_lower for word in ['export', 'save', 'download']):
-        return f"💾 I'll prepare the export based on: {instruction}\n\nPreparing export..."
-    else:
-        return f"✅ I understand your instruction: {instruction}\n\nI'll process your file accordingly using {st.session_state.selected_workflow}."
-
-# Reset chat function
-def reset_chat():
-    st.session_state.messages = []
-    st.session_state.workflow_selected = False
-    st.session_state.selected_workflow = None
-    st.session_state.file_upload_stage = False
-    st.session_state.uploaded_file = None
-    st.session_state.processing_complete = False
-    st.session_state.awaiting_instructions = False
-
-
-# Main chat container with scrollable area
-chat_container = st.container(height=520)
+# Main chat container
+chat_container = st.container(height=400)
 
 with chat_container:
     # Initial message
     if len(st.session_state.messages) == 0:
-        initial_message = "Hello! 👋 Welcome to the Workflow Assistant. What workflow are you interested in? You can click a button below or type your preference."
+        initial_message = "Please choose a workflow:"
         add_message("assistant", initial_message)
     
     # Display all chat messages
@@ -71,115 +42,98 @@ with chat_container:
         with st.chat_message(message["role"]):
             st.write(message["content"])
     
-    # Show workflow buttons if not yet selected
+    # Step 1: Show workflow buttons if not yet selected
     if not st.session_state.workflow_selected:
-        col1, col2, col3 = st.columns([0.1, 1, 1])
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("📦 Replenishment Workflow", type="primary", use_container_width=True):
+                st.session_state.workflow_selected = True
+                st.session_state.selected_workflow = "Replenishment"
+                add_message("user", "I selected Replenishment Workflow")
+                add_message("assistant", "Please provide the following dates:")
+                st.rerun()
         
         with col2:
-            if st.button("🔧 Workflow A", type="primary", use_container_width=True):
+            if st.button("🔄 Simulation Workflow", type="primary", use_container_width=True):
                 st.session_state.workflow_selected = True
-                st.session_state.selected_workflow = "Workflow A"
-                add_message("user", "I selected Workflow A")
-                add_message("assistant", f"Great choice! You've selected **Workflow A**. 📊\n\nNow, please upload the data file you want to process with this workflow.")
-                st.session_state.file_upload_stage = True
-                st.rerun()
-        
-        with col3:
-            if st.button("📈 Workflow B", type="primary", use_container_width=True):
-                st.session_state.workflow_selected = True
-                st.session_state.selected_workflow = "Workflow B"
-                add_message("user", "I selected Workflow B")
-                add_message("assistant", f"Excellent! You've selected **Workflow B**. 📈\n\nNow, please upload the data file you want to process with this workflow.")
-                st.session_state.file_upload_stage = True
+                st.session_state.selected_workflow = "Simulation"
+                add_message("user", "I selected Simulation Workflow")
+                add_message("assistant", "Simulation workflow selected. Processing...")
                 st.rerun()
     
-    # Show file uploader if workflow is selected but file not uploaded
-    if st.session_state.file_upload_stage and not st.session_state.uploaded_file:
-        with st.container():
-            st.markdown("### 📁 Upload Your Data File")
+    # Step 2: Collect dates for Replenishment workflow
+    if st.session_state.selected_workflow == "Replenishment" and not st.session_state.dates_collected:
+        with st.form(key="date_form"):
+            st.markdown("### Required Dates")
+            data_date = st.date_input("Data Date", value=date.today())
+            replenishment_date = st.date_input("Replenishment Date", value=date.today())
             
-            uploaded_file = st.file_uploader(
-                "Choose a file to upload",
-                type=['csv', 'txt', 'xlsx', 'json', 'pdf'],
-                help="Supported formats: CSV, TXT, XLSX, JSON, PDF",
-                key="file_uploader"
-            )
+            submit_button = st.form_submit_button("Submit Dates", type="primary", use_container_width=True)
             
-            if uploaded_file is not None:
-                st.session_state.uploaded_file = uploaded_file
-                
-                # Add upload confirmation to chat
-                add_message("user", f"I uploaded: {uploaded_file.name}")
-                
-                # Process based on workflow
-                file_size_mb = uploaded_file.size / (1024 * 1024)
-                
-                success_message = f"""✅ **File successfully uploaded!**"""
-                
-                add_message("assistant", success_message)
-                st.session_state.file_upload_stage = False
-                st.session_state.awaiting_instructions = True
+            if submit_button:
+                st.session_state.data_date = data_date
+                st.session_state.replenishment_date = replenishment_date
+                st.session_state.dates_collected = True
+                add_message("user", f"Data Date: {data_date}, Replenishment Date: {replenishment_date}")
+                add_message("assistant", "Dates received. Please upload any manual obligation exclusions:")
+                st.rerun()
+    
+    # Step 3: File upload for exclusions
+    if st.session_state.dates_collected and st.session_state.exclusion_file is None:
+        uploaded_file = st.file_uploader(
+            "Upload manual obligation exclusions",
+            type=['csv', 'xlsx', 'txt'],
+            key="exclusion_uploader"
+        )
+        
+        if uploaded_file is not None:
+            st.session_state.exclusion_file = uploaded_file
+            add_message("user", f"Uploaded: {uploaded_file.name}")
+            add_message("assistant", "File uploaded successfully. How do you want to update the constraint file?")
+            st.rerun()
+    
+    # Step 4: Show update method buttons
+    if st.session_state.exclusion_file and not st.session_state.update_method_selected:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("✏️ Manual Update", type="secondary", use_container_width=True):
+                st.session_state.update_method_selected = True
+                st.session_state.update_method = "Manual"
+                add_message("user", "Manual Update")
+                add_message("assistant", "Manual update selected. Processing constraint file manually...")
+                st.rerun()
+        
+        with col2:
+            if st.button("💬 Chat Update", type="primary", use_container_width=True):
+                st.session_state.update_method_selected = True
+                st.session_state.update_method = "Chat"
+                st.session_state.awaiting_chat_update = True
+                add_message("user", "Chat Update")
+                add_message("assistant", "Please say what you are going to update:")
                 st.rerun()
 
 # Chat input at the bottom (always visible)
 user_input = st.chat_input("Type your message here...")
 
 if user_input:
-    # Add user message to chat
-    add_message("user", user_input)
-    
-    # Process based on current state
-    if not st.session_state.workflow_selected:
-        # User typed instead of clicking buttons
-        if any(word in user_input.lower() for word in ['workflow a', 'a', 'first', 'option a']):
-            st.session_state.workflow_selected = True
-            st.session_state.selected_workflow = "Workflow A"
-            add_message("assistant", f"Great! You've selected **Workflow A**. 📊\n\nNow, please upload the data file you want to process.")
-            st.session_state.file_upload_stage = True
-        elif any(word in user_input.lower() for word in ['workflow b', 'b', 'second', 'option b']):
-            st.session_state.workflow_selected = True
-            st.session_state.selected_workflow = "Workflow B"
-            add_message("assistant", f"Excellent! You've selected **Workflow B**. 📈\n\nNow, please upload the data file you want to process.")
-            st.session_state.file_upload_stage = True
-        else:
-            add_message("assistant", "Please select either Workflow A or Workflow B by clicking the buttons above, or type 'Workflow A' or 'Workflow B'.")
-    
-    elif st.session_state.file_upload_stage:
-        # User is in file upload stage
-        add_message("assistant", "Please use the file uploader above to upload your data file. Once uploaded, you can provide specific processing instructions.")
-    
-    elif st.session_state.awaiting_instructions or st.session_state.uploaded_file:
-        # User has uploaded file and is providing instructions
-        response = process_user_instruction(user_input)
-        add_message("assistant", response)
+    # Step 5: Handle chat update instructions
+    if st.session_state.awaiting_chat_update:
+        add_message("user", user_input)
+        add_message("assistant", f"Understood. I will update the constraint file with: '{user_input}'\n\nProcessing update...")
+        st.session_state.awaiting_chat_update = False
         
-        # Simulate processing with progress bar
-        progress_placeholder = st.empty()
-        with progress_placeholder.container():
-            with st.spinner("Processing your request..."):
-                progress_bar = st.progress(0)
-                for i in range(100):
-                    time.sleep(0.02)
-                    progress_bar.progress(i + 1)
-        progress_placeholder.empty()
+        # Here you would process the actual update
+        # For now, just show completion
+        with st.spinner("Updating constraint file..."):
+            import time
+            time.sleep(2)
         
-        # Show completion
-        completion_msg = f"✨ **Task completed successfully!**\n\nYour file has been processed according to your instructions using {st.session_state.selected_workflow}.\n\nYou can:\n- Type additional instructions to further process the file\n- Type 'new file' to upload another file\n- Type 'restart' to start over with a new workflow"
-        add_message("assistant", completion_msg)
-        st.session_state.processing_complete = True
-        st.session_state.awaiting_instructions = False
-        
-        # Handle special commands
-        if 'new file' in user_input.lower():
-            st.session_state.file_upload_stage = True
-            st.session_state.uploaded_file = None
-            st.session_state.processing_complete = False
-            add_message("assistant", "Please upload a new file to process.")
-        elif 'restart' in user_input.lower():
-            reset_chat()
-    
+        add_message("assistant", "✅ Constraint file updated successfully with your specifications.")
     else:
-        # General conversation
-        add_message("assistant", f"I understand: '{user_input}'. How can I help you with your workflow today?")
+        # Handle other general input
+        add_message("user", user_input)
+        add_message("assistant", f"Received: '{user_input}'")
     
     st.rerun()
