@@ -1,0 +1,185 @@
+import streamlit as st
+import time
+
+# Page config
+st.set_page_config(
+    page_title="Workflow Chatbot",
+    page_icon="🤖",
+    layout="centered"
+)
+
+# Initialize session state variables
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+    st.session_state.workflow_selected = False
+    st.session_state.selected_workflow = None
+    st.session_state.file_upload_stage = False
+    st.session_state.uploaded_file = None
+    st.session_state.processing_complete = False
+    st.session_state.awaiting_instructions = False
+
+# Title
+st.title("🤖 Workflow Assistant Chatbot")
+
+# Function to add messages to chat
+def add_message(role, content):
+    st.session_state.messages.append({"role": role, "content": content})
+
+# Function to process user instructions
+def process_user_instruction(instruction):
+    """Process user instructions after file upload"""
+    instruction_lower = instruction.lower()
+    
+    # Detect different types of instructions
+    if any(word in instruction_lower for word in ['analyze', 'analysis', 'examine', 'study']):
+        return f"📊 I'll analyze your file with focus on: {instruction}\n\nStarting analysis now..."
+    elif any(word in instruction_lower for word in ['summary', 'summarize', 'overview']):
+        return f"📋 I'll create a summary based on your request: {instruction}\n\nGenerating summary..."
+    elif any(word in instruction_lower for word in ['filter', 'select', 'find', 'search']):
+        return f"🔍 I'll filter the data according to: {instruction}\n\nApplying filters..."
+    elif any(word in instruction_lower for word in ['transform', 'convert', 'change', 'modify']):
+        return f"🔧 I'll transform the data as requested: {instruction}\n\nProcessing transformations..."
+    elif any(word in instruction_lower for word in ['visualize', 'plot', 'graph', 'chart']):
+        return f"📈 I'll create visualizations for: {instruction}\n\nGenerating visualizations..."
+    elif any(word in instruction_lower for word in ['export', 'save', 'download']):
+        return f"💾 I'll prepare the export based on: {instruction}\n\nPreparing export..."
+    else:
+        return f"✅ I understand your instruction: {instruction}\n\nI'll process your file accordingly using {st.session_state.selected_workflow}."
+
+# Reset chat function
+def reset_chat():
+    st.session_state.messages = []
+    st.session_state.workflow_selected = False
+    st.session_state.selected_workflow = None
+    st.session_state.file_upload_stage = False
+    st.session_state.uploaded_file = None
+    st.session_state.processing_complete = False
+    st.session_state.awaiting_instructions = False
+
+
+# Main chat container with scrollable area
+chat_container = st.container(height=520)
+
+with chat_container:
+    # Initial message
+    if len(st.session_state.messages) == 0:
+        initial_message = "Hello! 👋 Welcome to the Workflow Assistant. What workflow are you interested in? You can click a button below or type your preference."
+        add_message("assistant", initial_message)
+    
+    # Display all chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+    
+    # Show workflow buttons if not yet selected
+    if not st.session_state.workflow_selected:
+        col1, col2, col3 = st.columns([0.1, 1, 1])
+        
+        with col2:
+            if st.button("🔧 Workflow A", type="primary", use_container_width=True):
+                st.session_state.workflow_selected = True
+                st.session_state.selected_workflow = "Workflow A"
+                add_message("user", "I selected Workflow A")
+                add_message("assistant", f"Great choice! You've selected **Workflow A**. 📊\n\nNow, please upload the data file you want to process with this workflow.")
+                st.session_state.file_upload_stage = True
+                st.rerun()
+        
+        with col3:
+            if st.button("📈 Workflow B", type="primary", use_container_width=True):
+                st.session_state.workflow_selected = True
+                st.session_state.selected_workflow = "Workflow B"
+                add_message("user", "I selected Workflow B")
+                add_message("assistant", f"Excellent! You've selected **Workflow B**. 📈\n\nNow, please upload the data file you want to process with this workflow.")
+                st.session_state.file_upload_stage = True
+                st.rerun()
+    
+    # Show file uploader if workflow is selected but file not uploaded
+    if st.session_state.file_upload_stage and not st.session_state.uploaded_file:
+        with st.container():
+            st.markdown("### 📁 Upload Your Data File")
+            
+            uploaded_file = st.file_uploader(
+                "Choose a file to upload",
+                type=['csv', 'txt', 'xlsx', 'json', 'pdf'],
+                help="Supported formats: CSV, TXT, XLSX, JSON, PDF",
+                key="file_uploader"
+            )
+            
+            if uploaded_file is not None:
+                st.session_state.uploaded_file = uploaded_file
+                
+                # Add upload confirmation to chat
+                add_message("user", f"I uploaded: {uploaded_file.name}")
+                
+                # Process based on workflow
+                file_size_mb = uploaded_file.size / (1024 * 1024)
+                
+                success_message = f"""✅ **File successfully uploaded!**"""
+                
+                add_message("assistant", success_message)
+                st.session_state.file_upload_stage = False
+                st.session_state.awaiting_instructions = True
+                st.rerun()
+
+# Chat input at the bottom (always visible)
+user_input = st.chat_input("Type your message here...")
+
+if user_input:
+    # Add user message to chat
+    add_message("user", user_input)
+    
+    # Process based on current state
+    if not st.session_state.workflow_selected:
+        # User typed instead of clicking buttons
+        if any(word in user_input.lower() for word in ['workflow a', 'a', 'first', 'option a']):
+            st.session_state.workflow_selected = True
+            st.session_state.selected_workflow = "Workflow A"
+            add_message("assistant", f"Great! You've selected **Workflow A**. 📊\n\nNow, please upload the data file you want to process.")
+            st.session_state.file_upload_stage = True
+        elif any(word in user_input.lower() for word in ['workflow b', 'b', 'second', 'option b']):
+            st.session_state.workflow_selected = True
+            st.session_state.selected_workflow = "Workflow B"
+            add_message("assistant", f"Excellent! You've selected **Workflow B**. 📈\n\nNow, please upload the data file you want to process.")
+            st.session_state.file_upload_stage = True
+        else:
+            add_message("assistant", "Please select either Workflow A or Workflow B by clicking the buttons above, or type 'Workflow A' or 'Workflow B'.")
+    
+    elif st.session_state.file_upload_stage:
+        # User is in file upload stage
+        add_message("assistant", "Please use the file uploader above to upload your data file. Once uploaded, you can provide specific processing instructions.")
+    
+    elif st.session_state.awaiting_instructions or st.session_state.uploaded_file:
+        # User has uploaded file and is providing instructions
+        response = process_user_instruction(user_input)
+        add_message("assistant", response)
+        
+        # Simulate processing with progress bar
+        progress_placeholder = st.empty()
+        with progress_placeholder.container():
+            with st.spinner("Processing your request..."):
+                progress_bar = st.progress(0)
+                for i in range(100):
+                    time.sleep(0.02)
+                    progress_bar.progress(i + 1)
+        progress_placeholder.empty()
+        
+        # Show completion
+        completion_msg = f"✨ **Task completed successfully!**\n\nYour file has been processed according to your instructions using {st.session_state.selected_workflow}.\n\nYou can:\n- Type additional instructions to further process the file\n- Type 'new file' to upload another file\n- Type 'restart' to start over with a new workflow"
+        add_message("assistant", completion_msg)
+        st.session_state.processing_complete = True
+        st.session_state.awaiting_instructions = False
+        
+        # Handle special commands
+        if 'new file' in user_input.lower():
+            st.session_state.file_upload_stage = True
+            st.session_state.uploaded_file = None
+            st.session_state.processing_complete = False
+            add_message("assistant", "Please upload a new file to process.")
+        elif 'restart' in user_input.lower():
+            reset_chat()
+    
+    else:
+        # General conversation
+        add_message("assistant", f"I understand: '{user_input}'. How can I help you with your workflow today?")
+    
+    st.rerun()
