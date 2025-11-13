@@ -1,0 +1,389 @@
+from main import *
+import streamlit as st
+import pandas as pd
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+import uuid
+from streamlit_tree_select import tree_select
+
+
+if "add_button_clicked" not in st.session_state:
+    st.session_state.add_button_clicked = False
+if "modified_button_clicked" not in st.session_state:
+    st.session_state.modified_button_clicked = False
+if "add_fields" not in st.session_state:
+    st.session_state.add_fields = {}
+if "param_fields" not in st.session_state:
+    st.session_state.param_fields = [{'id': str(uuid.uuid4()), 'param': '', 'constraint': '', 'value': []}]
+if "remove_index" not in st.session_state:
+    st.session_state.remove_index = None
+if "file_upload_trigger" not in st.session_state:
+    st.session_state.file_upload_trigger = False
+if "colour_id" not in st.session_state:
+    st.session_state.colour_id = []
+
+
+def add_param():
+    st.session_state.param_fields.append({'id':str(uuid.uuid4()),'param':'', 'constraint':'', 'value':[]})
+
+def remove_param(row_id):
+    st.session_state.param_fields = [row for row in st.session_state.param_fields if row['id']!=row_id]
+    for prefix in ['param_', 'constraint_', 'value_']:
+        widget_key = f"{prefix}{row_id}"
+        if widget_key in st.session_state:
+            del st.session_state[widget_key]
+    st.rerun()
+
+def show():
+    with st.sidebar:
+        genai_button = st.button("Chat to Update")
+        manual_button = st.button("Manual Update")
+    if genai_button:
+        st.session_state['current_page'] = "genai"
+        st.rerun()
+    if manual_button:
+        st.session_state['current_page'] = "form"
+        st.rerun()
+
+    st.write("## Click a row to edit")
+
+    gb = GridOptionsBuilder.from_dataframe(st.session_state.data)
+    gb.configure_selection(selection_mode = "single", use_checkbox = False)
+    grid_options = gb.build()
+
+    grid_response = AgGrid(
+        st.session_state.data,
+        gridOptions = grid_options,
+        update_mode = GridUpdateMode.SELECTION_CHANGED,
+        height = 200,
+        theme = 'streamlit',
+    )
+    col1, col2, col3 = st.columns([1,1, 1])
+    with col1:
+        added = st.button("Add Constraint")
+
+    with col2:
+        modified = st.button("Modify / Delete Constraint")
+
+    with col3:
+        # downloaded = st.button("Download")
+
+        downloaded = st.download_button(
+            label = "Download",
+            data = convert_df(st.session_state),
+            file_name = "file.xlsx",
+            mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key='download-excel'
+        )
+
+    if added:
+        st.session_state.add_button_clicked = True
+    if modified:
+        st.session_state.modified_button_clicked = True
+
+    if st.session_state.add_button_clicked is True:
+        st.session_state.modified_button_clicked = False
+        soft_stip = st.checkbox("Soft Stip")
+        constraint_name = st.selectbox(
+            "Constraint Name",
+            list(constraint_type_dict.keys()), accept_new_options=True
+        )
+
+        constraint_type = st.selectbox(
+            "Constraint Type",
+            constraint_type_dict.get(constraint_name, []), accept_new_options=True
+            # if have time, can add an accept_new_options in selectbox
+        )
+
+        condition = st.selectbox("Condition", condition_ls)
+        parameter_ratio = st.number_input("Parameter Ratio", step=0.01, format="%0.5f")
+
+        for idx, row in enumerate(st.session_state.param_fields):
+            row_id = row['id']
+            cols = st.columns([2, 1, 3, 0.5, 0.5])
+
+            row['param'] = cols[0].selectbox(f"Parameter {idx + 1}", list(parameter_dict.keys()),
+                                             index=list(parameter_dict.keys()).index(row['param']) if row[
+                                                                                                          'param'] in parameter_dict.keys() else None,
+                                             key=f"param_{row_id}")
+            row['constraint'] = cols[1].selectbox(f"Constraint {idx + 1}", ["", "in", ">=", "<=", "==", "!=", ">", "<"],
+                                                  key=f"constraint_{row_id}")
+
+            with cols[2]:
+                col_value, col_upload, col_range = st.columns([3, 1, 1])
+                if row['param'] == 'country_of_domicile' and row['constraint'] == 'in':
+                    with col_value:
+                        st.write("Country")
+                        row['value'] = process_tree_data(tree_select(tree_data), region_map_dict)
+                elif row['param'] in ['crg', 'moodys_lc', 'moodys_fc']:
+                    row['value'] = col_value.multiselect(
+                        f"Value {idx + 1}", parameter_dict.get(row['param'], [])+row['value'], default=row['value'],
+                        key=f"value_{row_id}", accept_new_options=True)
+                    use_range = col_range.checkbox("Range", key = f"chkbox_{row_id}")
+                    if use_range:
+                        if len(row['value']) != 2:
+                            st.warning("Please select exactly 2 ratings to define a range.")
+                        else:
+                            st.success(f"Rating selected: {check_cg(row['value'], row['param'])}")
+                            row['value'] = [check_cg(row['value'], row['param'])]
+                else:
+                    row["value"] = col_value.multiselect(
+                        f"Value {idx + 1}", parameter_dict.get(row['param'], [])+[""], default=row['value'],
+                        key=f"value_{row_id}", accept_new_options=True)
+
+                # Upload icon button
+                if col_upload.button("📁 Upload", key=f"upload_btn_{row_id}"):
+                    st.session_state.file_upload_trigger = True
+
+                # Show file_uploader only if triggered
+                if st.session_state.file_upload_trigger==True:
+                    uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"], key=f"file_{row_id}")
+                    if uploaded_file is not None:
+                        values_from_file = process_uploaded_individual_file(uploaded_file)
+                        row["value"] = [v for v in values_from_file if v in parameter_dict.get(row['param'], [])]
+                        st.session_state.file_upload_trigger = False
+                        st.rerun()
+            with cols[3]:
+                if st.button("➕", key=f"add_{row_id}"):
+                    add_param()
+
+            with cols[4]:
+                if st.button("➖", key=f"remove_{row_id}"):
+                    remove_param(row_id)
+
+        if st.button("Submit"):
+            st.session_state.add_fields = {"constraint_name":constraint_name,
+             "constraint_type":constraint_type,
+             "soft_stip":soft_stip,
+             "condition":condition,
+             "parameter_ratio":parameter_ratio,
+             "parameter_fields":st.session_state.param_fields,
+             }
+            # need to add the fields into pandas dataframe
+            st.session_state.param_fields = [{'id':str(uuid.uuid4()),'param': '', 'constraint': '', 'value': ''}]
+            st.write(st.session_state.add_fields)
+            st.success("New constraint added!")
+            previous_id = st.session_state.data.loc[len(st.session_state.data)-1, 'ID']
+            new_row = transform_param_fields(previous_id, st.session_state.add_fields)
+            st.table(new_row)
+            st.session_state.data = pd.concat([st.session_state.data, new_row], ignore_index=True)
+            st.session_state.colour_id.append(previous_id + 1)
+            st.session_state.add_button_clicked = False
+            # st.rerun()
+
+    selected_row = grid_response["selected_rows"]
+    if selected_row is not None and len(selected_row)>0:
+        st.session_state.add_button_clicked = False
+        st.session_state.modified_button_clicked = False
+        updated_row = dict()
+        with st.expander("Edit Row", expanded=True):
+            for col in selected_row.columns:
+                updated_row[col] = selected_row[col][0]
+
+            updated_row['soft_stip'] = "Y" if st.checkbox("Soft Stip", value = True if selected_row['soft_stip'][0]=="Y" else False) is True else ""
+            updated_row['constraint_name'] = st.text_input("Constraint Name",value = selected_row['constraint_name'][0])
+            updated_row['constraint_type'] = st.text_input("Constraint Type", value=selected_row['constraint_type'][0])
+            updated_row['condition'] = st.text_input("Condition", value=selected_row['condition'][0])
+            updated_row['parameter_ratio'] = st.text_input("parameter_ratio", value=selected_row['parameter_ratio'][0])
+
+            for j in range(1, len(num_constraint_set)+1):
+                cols = st.columns([3, 3, 3, 1, 1])
+                updated_row[f'parameter{j}'] = parameter = cols[0].selectbox(label = f"Parameter {j}", options = list(parameter_dict.keys())+[""],
+                                              index=(list(parameter_dict.keys())+[""]).index(selected_row[f'parameter{j}'][0]),
+                                              key = f"param_{j}")
+                # parameter = cols[0].selectbox(f"Parameter {j}", list(parameter_dict.keys()),
+                #                                  index=list(parameter_dict.keys()).index(selected_row[f'parameter{j}'][0]) if selected_row[f'parameter{j}'][0] in parameter_dict.keys() else None, key=f"param_{j}")
+
+                updated_row[f'constraint{j}'] = constraint = cols[1].selectbox(label = f"Constraint {j}", options = ["", "in", ">=", "<=", "==", "!=", ">", "<"], index = ["", "in", ">=", "<=", "==", "!=", ">", "<"].index(selected_row[f'constraint{j}'][0]) if selected_row[f'constraint{j}'][0] in ["", "in", ">=", "<=", "==", "!=", ">", "<"] else None,
+                                                      key=f"constraint_{j}")
+                param_value_split = split_by_delimiter(str(selected_row[f'parameter_value{j}'][0]))
+
+                if parameter == 'country_of_domicile' and constraint == 'in':
+                    with cols[2]:
+                        st.write("Country")
+                        updated_row[f'parameter_value{j}'] = process_tree_data(tree_select(tree_data, checked=param_value_split), region_map_dict)
+                elif parameter in ['a', 'b', 'c']:
+                    with cols[2]:
+                        col_rating, col_checkbox = st.columns([3, 2])
+                        updated_row[f'parameter_value{j}'] = col_rating.multiselect(label=f"Value {j}", options=list(
+                            set(parameter_dict.get(parameter, []) + param_value_split + [updated_row[f'parameter_value{j}']])), default=param_value_split,
+                                                                                 accept_new_options=True)
+
+                        use_range = col_checkbox.checkbox("Range")
+                        if use_range:
+                            if len(updated_row[f'parameter_value{j}']) != 2:
+                                st.warning("Please select exactly 2 ratings to define a range.")
+                            else:
+                                st.success(f"Rating selected: {check_cg(updated_row[f'parameter_value{j}'], parameter)}")
+                                updated_row[f'parameter_value{j}'] = check_cg(updated_row[f'parameter_value{j}'], parameter)
+                elif constraint == "in":
+                    updated_row[f'parameter_value{j}'] = cols[2].multiselect(label = f"Value {j}", options = list(set(parameter_dict.get(parameter, [])+param_value_split)), default=param_value_split, accept_new_options = True)
+                else:
+                    updated_row[f'parameter_value{j}'] = cols[2].selectbox(label = f"Value {j}", options = list(set(parameter_dict.get(parameter, [])+[""]+param_value_split)),
+                                              index = (list(set(parameter_dict.get(parameter, [])+[""]+param_value_split))).index(param_value_split[0]),
+                                                key=f"value_{j}", accept_new_options = True)
+
+            col4, col5, col6 = st.columns([1, 1, 1])
+            with col4:
+                submitted = st.button("Update Constraint")
+            with col5:
+                save_new = st.button("Save as New Constraint")
+            with col6:
+                deleted = st.button("Delete Constraint")
+
+        if submitted:
+            row_index = updated_row['ID']
+            for col in df.columns:
+                st.session_state.data.loc[row_index-1, col] = updated_row[col]
+            st.success("Constraint updated successfully!")
+            st.session_state.colour_id.append(row_index)
+            # st.rerun()
+        if save_new:
+            new_data_dict = dict()
+            row_index = updated_row['ID']
+            previous_id = st.session_state.data.loc[len(st.session_state.data) - 1, 'ID']
+            for col in st.session_state.data.columns:
+                new_data_dict[col] = updated_row[col]
+            new_data_dict['ID'] = previous_id+1
+            st.session_state.data = pd.concat([st.session_state.data, pd.DataFrame([new_data_dict])], ignore_index=True)
+            st.table(pd.DataFrame([new_data_dict]))
+            st.session_state.colour_id.append(previous_id+1)
+            # st.rerun()
+
+        if deleted:
+            row_index = updated_row['ID']
+            st.session_state.data.drop(index = row_index-1, inplace=True)
+            st.session_state.data.reset_index(drop=True, inplace = True)
+            st.success("Constraint deleted successfully")
+            # st.rerun()
+
+    if st.session_state.modified_button_clicked is True:
+        st.session_state.add_button_clicked = False
+        searched = st.text_input(label = "Search to filter the constraint table", value = "", placeholder = "E.g. crg")
+        if searched:
+            filtered_table = filter_row_based_on_text(st.session_state.data, searched)
+            gb_v1 = GridOptionsBuilder.from_dataframe(filtered_table)
+            gb_v1.configure_selection(selection_mode="single", use_checkbox=False)
+            grid_options_v1 = gb_v1.build()
+
+            grid_response_v1 = AgGrid(
+                filtered_table,
+                gridOptions=grid_options_v1,
+                update_mode=GridUpdateMode.SELECTION_CHANGED,
+                height=200,
+                theme='streamlit',
+            )
+            selected_row_v1 = grid_response_v1["selected_rows"]
+            if selected_row_v1 is not None and len(selected_row_v1) > 0:
+                updated_row = dict()
+                with st.expander("Edit Row", expanded=True):
+                    for col in selected_row_v1.columns:
+                        updated_row[col] = selected_row_v1[col][0]
+
+                    updated_row['soft_stip'] = "Y" if st.checkbox("Soft Stip", value=True if selected_row_v1['soft_stip'][
+                                                                                                 0] == "Y" else False) is True else ""
+                    updated_row['constraint_name'] = st.text_input("Constraint Name",
+                                                                   value=selected_row_v1['constraint_name'][0])
+                    updated_row['constraint_type'] = st.text_input("Constraint Type",
+                                                                   value=selected_row_v1['constraint_type'][0])
+                    updated_row['condition'] = st.text_input("Condition", value=selected_row_v1['condition'][0])
+                    updated_row['parameter_ratio'] = st.text_input("parameter_ratio",
+                                                                   value=selected_row_v1['parameter_ratio'][0])
+
+                    for j in range(1, len(num_constraint_set) + 1):
+                        cols = st.columns([3, 3, 3, 1, 1])
+                        updated_row[f'parameter{j}'] = parameter = cols[0].selectbox(label=f"Parameter {j}",
+                                                                                     options=list(parameter_dict.keys()) + [
+                                                                                         ""],
+                                                                                     index=(list(parameter_dict.keys()) + [
+                                                                                         ""]).index(
+                                                                                         selected_row_v1[f'parameter{j}'][0]),
+                                                                                     key=f"param_{j}")
+                        # parameter = cols[0].selectbox(f"Parameter {j}", list(parameter_dict.keys()),
+                        #                                  index=list(parameter_dict.keys()).index(selected_row[f'parameter{j}'][0]) if selected_row[f'parameter{j}'][0] in parameter_dict.keys() else None, key=f"param_{j}")
+
+                        updated_row[f'constraint{j}'] = constraint = cols[1].selectbox(label=f"Constraint {j}",
+                                                                                       options=["", "in", ">=", "<=", "==",
+                                                                                                "!=", ">", "<"],
+                                                                                       index=["", "in", ">=", "<=", "==",
+                                                                                              "!=", ">", "<"].index(
+                                                                                           selected_row_v1[f'constraint{j}'][
+                                                                                               0]) if
+                                                                                       selected_row_v1[f'constraint{j}'][
+                                                                                           0] in ["", "in", ">=", "<=",
+                                                                                                  "==", "!=", ">",
+                                                                                                  "<"] else None,
+                                                                                       key=f"constraint_{j}")
+                        param_value_split = split_by_delimiter(str(selected_row_v1[f'parameter_value{j}'][0]))
+
+                        if parameter == 'country_of_domicile' and constraint == 'in':
+                            with cols[2]:
+                                st.write("Country")
+                                updated_row[f'parameter_value{j}'] = process_tree_data(tree_select(tree_data, checked=param_value_split), region_map_dict)
+                        elif parameter in ['crg', 'moodys_lc', 'moodys_fc']:
+                            with cols[2]:
+                                col_rating, col_checkbox = st.columns([3, 2])
+                                updated_row[f'parameter_value{j}'] = col_rating.multiselect(label=f"Value {j}", options=list(
+                                    set(parameter_dict.get(parameter, []) + param_value_split+[updated_row[f'parameter_value{j}']])), default=param_value_split,
+                                                                                         accept_new_options=True)
+
+                                use_range = col_checkbox.checkbox("Range")
+                                if use_range:
+                                    if len(updated_row[f'parameter_value{j}']) != 2:
+                                        st.warning("Please select exactly 2 ratings to define a range.")
+                                    else:
+                                        st.success(
+                                            f"Rating selected: {check_cg(updated_row[f'parameter_value{j}'], parameter)}")
+                                        updated_row[f'parameter_value{j}'] = check_cg(updated_row[f'parameter_value{j}'], parameter)
+                        elif constraint == "in":
+                            updated_row[f'parameter_value{j}'] = cols[2].multiselect(label=f"Value {j}", options=list(
+                                set(parameter_dict.get(parameter, []) + param_value_split)), default=param_value_split,
+                                                                                     accept_new_options=True)
+                        else:
+                            updated_row[f'parameter_value{j}'] = cols[2].selectbox(label=f"Value {j}", options=list(
+                                set(parameter_dict.get(parameter, []) + [""] + param_value_split)),
+                                                                                   index=(list(
+                                                                                       set(parameter_dict.get(parameter,
+                                                                                                              []) + [
+                                                                                               ""] + param_value_split))).index(
+                                                                                       param_value_split[0]),
+                                                                                   key=f"value_{j}",
+                                                                                   accept_new_options=True)
+
+                    col3, col4, col5 = st.columns([1, 1, 1])
+                    with col3:
+                        submitted = st.button("Update Constraint")
+                    with col4:
+                        save_new = st.button("Save as New Constraint")
+                    with col5:
+                        deleted = st.button("Delete Constraint")
+
+                if submitted:
+                    row_index = updated_row['ID']
+                    print(updated_row)
+                    for col in df.columns:
+                        st.session_state.data.loc[row_index - 1, col] = transform_updated_field(updated_row[col])
+                    st.success("Constraint updated successfully!")
+                    st.session_state.colour_id.append(row_index)
+                    st.session_state.modified_button_clicked = False
+                    st.rerun()
+
+                if save_new:
+                    new_data_dict = dict()
+                    row_index = updated_row['ID']
+                    previous_id = st.session_state.data.loc[len(st.session_state.data) - 1, 'ID']
+                    for col in st.session_state.data.columns:
+                        new_data_dict[col] = transform_updated_field(updated_row[col])
+                    new_data_dict['ID'] = previous_id + 1
+                    st.session_state.data = pd.concat([st.session_state.data, pd.DataFrame([new_data_dict])],
+                                                      ignore_index=True)
+                    st.session_state.colour_id.append(previous_id + 1)
+                    st.table(pd.DataFrame([new_data_dict]))
+                    st.rerun()
+
+                if deleted:
+                    row_index = updated_row['ID']
+                    st.session_state.data.drop(index=row_index - 1, inplace=True)
+                    st.session_state.data.reset_index(drop=True, inplace=True)
+                    st.success("Constraint deleted successfully")
+                    st.session_state.modified_button_clicked = False
+                    # st.rerun()
