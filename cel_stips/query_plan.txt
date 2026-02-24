@@ -1,4 +1,21 @@
 import pandas as pd
+plan = {
+  "filters": [
+    {"field": "portfolio", "op": "=", "value": "SUMERU_V"},
+    {"field": "dimension_type", "op": "=", "value": "country"}
+  ],
+  "group_by": ["dimension_value"],
+  "metrics": [
+    {"name": "replenished_amt", "field": "new_replenished_amount", "agg": "sum"}
+  ],
+  "sort": [{"field": "replenished_amt", "direction": "desc"}],
+  "limit": 5
+}
+
+out = execute_query_plan(plan, df_normalized)
+print(out["meta"])
+print(out["data"])
+
 
 ALLOWED_FIELDS = {
     "portfolio", "dimension_type", "dimension_value", "source_tab",
