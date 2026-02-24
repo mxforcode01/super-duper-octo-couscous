@@ -1,104 +1,114 @@
 import json
-import pandas as pd
 import re
+import pandas as pd
+from typing import Any, Dict, List, Optional
 
 # ============================================================
-# 1️⃣ SYSTEM PROMPTS
+# 0) CONTRACT: YOU PROVIDE THESE
+# ============================================================
+# def call_llm(system_prompt: str, user_prompt: str) -> str:
+#     ...
+#
+# def execute_query_plan(plan: dict, df_normalized: pd.DataFrame) -> dict:
+#     """
+#     Must return:
+#       {"data": <pd.DataFrame>, "meta": {...}}
+#     """
+#     ...
+
+# ============================================================
+# 1) ALLOWLISTS + NORMALIZATION DICTIONARIES
 # ============================================================
 
-QUERY_PLANNER_SYSTEM_PROMPT = """
-You are a financial analytics query planner.
-
-Your task:
-Convert the user's question into a STRICT JSON query plan.
-
-Rules:
-- Output JSON only. No explanation.
-- Never calculate numbers.
-- Never invent fields.
-- Only use allowed fields and aggregations.
-- If the question cannot be answered using available fields, return:
-  {"error": "UNSUPPORTED_QUERY"}
-
-Allowed fields:
-portfolio
-dimension_type
-dimension_value
-old_ref_values
-reduction
-new_ref_values
-new_replenished_amount
-new_replenished_obligations
-unique_group_ids
-unique_obligor_ids
-whitelisted_existing_amount
-whitelisted_replenished_amount
-whitelisted_total_amount
-h_score_new_ref_value
-h_score_new_replenished_amount
-
-Allowed aggregations:
-sum
-mean
-min
-max
-count
-nunique
-
-Allowed derived operations:
-ratio
-diff
-
-Valid dimension_type values:
-portfolio
-crg
-country
-industry
-
-JSON schema:
-{
-  "filters": [],
-  "group_by": [],
-  "metrics": [],
-  "derived": [],
-  "sort": [],
-  "limit": 10
+ALLOWED_FIELDS = {
+    "portfolio","dimension_type","dimension_value","source_tab",
+    "old_ref_values","reduction","new_ref_values",
+    "new_replenished_amount","new_replenished_obligations",
+    "unique_group_ids","unique_obligor_ids",
+    "whitelisted_existing_amount","whitelisted_replenished_amount","whitelisted_total_amount",
+    "h_score_new_ref_value","h_score_new_replenished_amount",
 }
-"""
 
-ANSWER_WRITER_SYSTEM_PROMPT = """
-You are a risk analytics assistant.
+ALLOWED_AGGS = {"sum","mean","min","max","count","nunique"}
+ALLOWED_OPS = {"=","!=","in","not_in",">",">=","<","<="}
+ALLOWED_DERIVED_OPS = {"ratio","diff"}
+ALLOWED_SORT_DIR = {"asc","desc"}
+ALLOWED_DIMENSION_TYPES = {"portfolio","crg","country","industry"}
 
-You will be given:
-- The user's question
-- The executed query metadata
-- A result table (already computed)
+# common user/LLM synonyms -> canonical values
+FIELD_SYNONYMS = {
+    # replenishment / exposure
+    "replenished_amount": "new_replenished_amount",
+    "replenishment": "new_replenished_amount",
+    "replenished": "new_replenished_amount",
+    "replenished_amt": "new_replenished_amount",
+    "new_repl_amount": "new_replenished_amount",
 
-Rules:
-- Do not invent numbers.
-- Base your answer only on provided data.
-- Mention which sheet tabs were used.
-- Be concise and business friendly.
-- If result empty, say no matching results found.
+    "exposure": "new_ref_values",
+    "new_exposure": "new_ref_values",
+    "new_reference": "new_ref_values",
+    "new_reference_values": "new_ref_values",
+    "old_exposure": "old_ref_values",
+    "old_reference": "old_ref_values",
+    "old_reference_values": "old_ref_values",
 
-Return plain text only.
-"""
+    "h_score": "h_score_new_ref_value",
+    "hscore": "h_score_new_ref_value",
+
+    "whitelist_total": "whitelisted_total_amount",
+    "whitelisted": "whitelisted_total_amount",
+}
+
+DIMENSION_SYNONYMS = {
+    "countries": "country",
+    "country_of_domicile": "country",
+    "industry": "industry",
+    "industries": "industry",
+    "moodys_industry_desc": "industry",
+    "credit_grade": "crg",
+    "rating": "crg",
+    "crg_bucket": "crg",
+}
+
+OP_SYNONYMS = {
+    "==": "=",
+    "equals": "=",
+    "equal": "=",
+    "is": "=",
+    "not equals": "!=",
+    "not_equal": "!=",
+    "!=": "!=",
+    "in": "in",
+    "not in": "not_in",
+    "gte": ">=",
+    "lte": "<=",
+    "gt": ">",
+    "lt": "<",
+}
+
+SORT_DIR_SYNONYMS = {
+    "descending": "desc",
+    "descend": "desc",
+    "ascend": "asc",
+    "ascending": "asc",
+}
 
 # ============================================================
-# 2️⃣ UNSUPPORTED QUESTION DETECTION
+# 2) UNSUPPORTED QUESTION DETECTION (summary-tabs only)
 # ============================================================
 
 UNSUPPORTED_KEYWORDS = {
-    "past due": "Requires asset-level past due data not available in summary tabs.",
-    "subordinated": "Requires asset-level subordinated flag not available.",
-    "extended maturity": "Requires asset-level maturity fields not available.",
-    "rodd": "Requires maturity comparison data.",
-    "reference id": "Requires asset-level reference IDs.",
-    "downgrade": "Requires historical comparison table.",
-    "previous month": "Requires historical comparison data.",
+    "past due": "Requires asset-level delinquency/past-due fields (not in summary tabs).",
+    "subordinated": "Requires asset-level subordinated flag (not in summary tabs).",
+    "extended maturity": "Requires asset-level maturity dates (not in summary tabs).",
+    "rodd": "Requires asset-level rodd date (not in summary tabs).",
+    "reference id": "Requires asset-level reference IDs (not in summary tabs).",
+    "obligor name": "Requires asset-level obligor names/IDs (not in summary tabs).",
+    "downgrade": "Requires previous month / history table to compute rating changes.",
+    "previous month": "Requires previous month / history table to compute changes.",
 }
 
-def detect_unsupported_by_text(user_question: str):
+def detect_unsupported_by_text(user_question: str) -> Optional[str]:
     q = user_question.lower()
     for k, reason in UNSUPPORTED_KEYWORDS.items():
         if k in q:
@@ -106,204 +116,534 @@ def detect_unsupported_by_text(user_question: str):
     return None
 
 # ============================================================
-# 3️⃣ METRIC SYNONYM ENRICHMENT
+# 3) FEW-SHOT SYSTEM PROMPT (KEY FIX)
 # ============================================================
 
-METRIC_SYNONYMS = {
-    "replenished": "new_replenished_amount",
-    "increase": "new_ref_values",
-    "exposure": "new_ref_values",
-    "reduction": "reduction",
-    "h score": "h_score_new_ref_value",
-    "whitelist": "whitelisted_total_amount"
-}
+QUERY_PLANNER_SYSTEM_PROMPT = f"""
+You are a financial analytics query planner.
 
-def enrich_user_prompt(user_question: str):
-    synonym_text = "\nMetric Synonyms:\n"
-    for k, v in METRIC_SYNONYMS.items():
-        synonym_text += f"- '{k}' maps to '{v}'\n"
+You MUST output JSON only (no prose). Your JSON must follow this schema:
 
-    return f"""
-User Question:
-{user_question}
+{{
+  "filters": [{{"field":"...", "op":"=", "value":"..."}}],
+  "group_by": ["..."],
+  "metrics": [{{"name":"...", "field":"...", "agg":"sum"}}],
+  "derived": [{{"name":"...", "op":"ratio", "num":"...", "den":"..."}}],
+  "sort": [{{"field":"...", "direction":"desc"}}],
+  "limit": 10
+}}
 
-{synonym_text}
+Rules:
+- Use ONLY allowed fields and allowed aggregations below.
+- Never invent columns.
+- Never calculate numbers; only plan the computation.
+- If user asks for something not answerable from summary tabs, output:
+  {{"error":"UNSUPPORTED_QUERY"}}
+
+Allowed fields:
+{sorted(list(ALLOWED_FIELDS))}
+
+Allowed aggregations:
+{sorted(list(ALLOWED_AGGS))}
+
+Allowed filter ops:
+{sorted(list(ALLOWED_OPS))}
+
+Allowed derived ops:
+{sorted(list(ALLOWED_DERIVED_OPS))}
+
+Valid dimension_type values:
+{sorted(list(ALLOWED_DIMENSION_TYPES))}
+
+IMPORTANT:
+- For breakdown questions, set filter dimension_type appropriately (country/industry/crg/portfolio).
+- Use dimension_value as the bucket field for group_by.
+
+EXAMPLES (follow the style exactly):
+
+Example 1:
+User: Top 5 countries replenished in SUMERU_V
+JSON:
+{{
+  "filters": [
+    {{"field":"portfolio","op":"=","value":"SUMERU_V"}},
+    {{"field":"dimension_type","op":"=","value":"country"}}
+  ],
+  "group_by": ["dimension_value"],
+  "metrics": [
+    {{"name":"replenished_amt","field":"new_replenished_amount","agg":"sum"}}
+  ],
+  "derived": [],
+  "sort": [{{"field":"replenished_amt","direction":"desc"}}],
+  "limit": 5
+}}
+
+Example 2:
+User: Which industries increased the most in KHARTAPHU_III?
+JSON:
+{{
+  "filters": [
+    {{"field":"portfolio","op":"=","value":"KHARTAPHU_III"}},
+    {{"field":"dimension_type","op":"=","value":"industry"}}
+  ],
+  "group_by": ["dimension_value"],
+  "metrics": [
+    {{"name":"new_val","field":"new_ref_values","agg":"sum"}},
+    {{"name":"old_val","field":"old_ref_values","agg":"sum"}}
+  ],
+  "derived": [
+    {{"name":"delta","op":"diff","a":"new_val","b":"old_val"}}
+  ],
+  "sort": [{{"field":"delta","direction":"desc"}}],
+  "limit": 10
+}}
+
+Example 3:
+User: Show CRG breakdown for SUMERU_IV
+JSON:
+{{
+  "filters": [
+    {{"field":"portfolio","op":"=","value":"SUMERU_IV"}},
+    {{"field":"dimension_type","op":"=","value":"crg"}}
+  ],
+  "group_by": ["dimension_value"],
+  "metrics": [
+    {{"name":"new_exposure","field":"new_ref_values","agg":"sum"}},
+    {{"name":"replenished_amt","field":"new_replenished_amount","agg":"sum"}}
+  ],
+  "derived": [],
+  "sort": [{{"field":"new_exposure","direction":"desc"}}],
+  "limit": 50
+}}
 """
 
+# Extra “context” you pass in the user prompt:
+METRIC_GUIDE = """
+Metric guide (use these exact column names in JSON):
+- replenished amount -> new_replenished_amount
+- new exposure -> new_ref_values
+- old exposure -> old_ref_values
+- reduction -> reduction
+- whitelisted total -> whitelisted_total_amount
+- h-score (portfolio tab only) -> h_score_new_ref_value or h_score_new_replenished_amount
+"""
+
+def build_planner_user_prompt(user_question: str) -> str:
+    return f"User question:\n{user_question}\n\n{METRIC_GUIDE}".strip()
+
 # ============================================================
-# 4️⃣ PLAN GENERATION
+# 4) PLAN COERCION + NORMALIZATION (FIXES MOST ERRORS)
 # ============================================================
 
-def generate_query_plan(user_question: str):
-    user_prompt = enrich_user_prompt(user_question)
+def _canon_field(field: str) -> str:
+    if field is None:
+        return field
+    f = field.strip()
+    f_low = f.lower().replace(" ", "_")
+    return FIELD_SYNONYMS.get(f_low, f_low)
 
-    llm_response = call_llm(
-        system_prompt=QUERY_PLANNER_SYSTEM_PROMPT,
-        user_prompt=user_prompt
-    )
+def _canon_dimension_value(val: str) -> str:
+    if val is None:
+        return val
+    v = val.strip()
+    v_low = v.lower().replace(" ", "_")
+    return DIMENSION_SYNONYMS.get(v_low, val)
 
+def _canon_op(op: str) -> str:
+    if op is None:
+        return op
+    o = op.strip().lower()
+    return OP_SYNONYMS.get(o, op)
+
+def _canon_sort_dir(d: str) -> str:
+    if d is None:
+        return d
+    s = d.strip().lower()
+    return SORT_DIR_SYNONYMS.get(s, s)
+
+def coerce_plan_defaults(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure required keys exist with safe defaults, and normalize common synonyms."""
+    if not isinstance(plan, dict):
+        return {"error": "UNSUPPORTED_QUERY"}
+
+    if "error" in plan:
+        return plan
+
+    # required top-level keys
+    plan.setdefault("filters", [])
+    plan.setdefault("group_by", [])
+    plan.setdefault("metrics", [])
+    plan.setdefault("derived", [])
+    plan.setdefault("sort", [])
+    plan.setdefault("limit", 50)
+
+    # normalize limit
     try:
-        plan = json.loads(llm_response.strip())
-    except json.JSONDecodeError:
-        raise ValueError("LLM did not return valid JSON.")
+        plan["limit"] = int(plan.get("limit", 50))
+    except Exception:
+        plan["limit"] = 50
+    plan["limit"] = max(1, min(plan["limit"], 500))
+
+    # normalize filters
+    norm_filters = []
+    for f in plan.get("filters", []) or []:
+        if not isinstance(f, dict):
+            continue
+        field = _canon_field(f.get("field", ""))
+        op = _canon_op(f.get("op", "="))
+        value = f.get("value")
+
+        # normalize dimension_type values if applicable
+        if field == "dimension_type" and isinstance(value, str):
+            value = _canon_dimension_value(value)
+            value = value.lower()
+        norm_filters.append({"field": field, "op": op, "value": value})
+    plan["filters"] = norm_filters
+
+    # normalize group_by
+    plan["group_by"] = [_canon_field(g) for g in (plan.get("group_by") or [])]
+
+    # normalize metrics
+    norm_metrics = []
+    for m in plan.get("metrics", []) or []:
+        if not isinstance(m, dict):
+            continue
+        name = m.get("name") or f"{m.get('agg','sum')}_{m.get('field','')}"
+        field = _canon_field(m.get("field", ""))
+        agg = (m.get("agg") or "sum").strip().lower()
+        norm_metrics.append({"name": name, "field": field, "agg": agg})
+    plan["metrics"] = norm_metrics
+
+    # normalize derived
+    norm_derived = []
+    for d in plan.get("derived", []) or []:
+        if not isinstance(d, dict):
+            continue
+        op = (d.get("op") or "").strip().lower()
+        if op == "ratio":
+            norm_derived.append({
+                "name": d.get("name","ratio"),
+                "op": "ratio",
+                "num": d.get("num"),
+                "den": d.get("den")
+            })
+        elif op == "diff":
+            norm_derived.append({
+                "name": d.get("name","diff"),
+                "op": "diff",
+                "a": d.get("a"),
+                "b": d.get("b")
+            })
+    plan["derived"] = norm_derived
+
+    # normalize sort
+    norm_sort = []
+    for s in plan.get("sort", []) or []:
+        if not isinstance(s, dict):
+            continue
+        field = _canon_field(s.get("field",""))
+        direction = _canon_sort_dir(s.get("direction","desc"))
+        norm_sort.append({"field": field, "direction": direction})
+    plan["sort"] = norm_sort
 
     return plan
 
-# ============================================================
-# 5️⃣ PLAN VALIDATION
-# ============================================================
-
-ALLOWED_FIELDS = {
-    "portfolio","dimension_type","dimension_value",
-    "old_ref_values","reduction","new_ref_values",
-    "new_replenished_amount","new_replenished_obligations",
-    "unique_group_ids","unique_obligor_ids",
-    "whitelisted_existing_amount","whitelisted_replenished_amount",
-    "whitelisted_total_amount",
-    "h_score_new_ref_value","h_score_new_replenished_amount"
-}
-
-ALLOWED_AGGS = {"sum","mean","min","max","count","nunique"}
-ALLOWED_DERIVED = {"ratio","diff"}
-
-def validate_plan(plan: dict):
+def validate_plan_strict(plan: Dict[str, Any]) -> None:
+    """Raise ValueError if plan still violates contract after coercion."""
     if "error" in plan:
-        raise ValueError("Unsupported query.")
+        raise ValueError(plan["error"])
 
-    for f in plan.get("filters", []):
+    # keys exist (coerce should have set them)
+    for k in ["filters","group_by","metrics","derived","sort","limit"]:
+        if k not in plan:
+            raise ValueError(f"Missing key: {k}")
+
+    # validate filters
+    for f in plan["filters"]:
         if f["field"] not in ALLOWED_FIELDS:
             raise ValueError(f"Invalid filter field: {f['field']}")
+        if f["op"] not in ALLOWED_OPS:
+            raise ValueError(f"Invalid filter op: {f['op']}")
+        # validate dimension_type values
+        if f["field"] == "dimension_type":
+            v = f["value"]
+            if isinstance(v, str) and v.lower() not in ALLOWED_DIMENSION_TYPES:
+                raise ValueError(f"Invalid dimension_type value: {v}")
 
-    for m in plan.get("metrics", []):
+    # group_by
+    for g in plan["group_by"]:
+        if g not in ALLOWED_FIELDS:
+            raise ValueError(f"Invalid group_by field: {g}")
+
+    # metrics
+    for m in plan["metrics"]:
         if m["field"] not in ALLOWED_FIELDS:
             raise ValueError(f"Invalid metric field: {m['field']}")
         if m["agg"] not in ALLOWED_AGGS:
-            raise ValueError(f"Invalid aggregation: {m['agg']}")
+            raise ValueError(f"Invalid agg: {m['agg']}")
 
-    for d in plan.get("derived", []):
-        if d["op"] not in ALLOWED_DERIVED:
+    # derived
+    for d in plan["derived"]:
+        if d["op"] not in ALLOWED_DERIVED_OPS:
             raise ValueError(f"Invalid derived op: {d['op']}")
 
-    return True
+    # sort
+    for s in plan["sort"]:
+        if s["direction"] not in ALLOWED_SORT_DIR:
+            raise ValueError(f"Invalid sort direction: {s['direction']}")
 
 # ============================================================
-# 6️⃣ H-SCORE (HHI)
+# 5) OPTIONAL: PLAN REPAIR (1 retry) — VERY EFFECTIVE IN PRACTICE
 # ============================================================
 
-def compute_hhi(df, portfolio=None, dimension_type="country", exposure_field="new_ref_values"):
-    d = df.copy()
+REPAIR_SYSTEM_PROMPT = """
+You fix JSON query plans to match a strict schema.
+Return JSON only. No explanation.
+"""
+
+def repair_plan_with_llm(user_question: str, bad_plan_text: str, error_msg: str) -> Dict[str, Any]:
+    prompt = f"""
+User question:
+{user_question}
+
+The JSON below failed validation/execution.
+Error:
+{error_msg}
+
+Fix it to comply with the schema (filters/group_by/metrics/derived/sort/limit) and allowed fields/ops/aggs.
+
+Bad JSON:
+{bad_plan_text}
+""".strip()
+
+    repaired_text = call_llm(REPAIR_SYSTEM_PROMPT, prompt).strip()
+    try:
+        return json.loads(repaired_text)
+    except Exception:
+        return {"error": "UNSUPPORTED_QUERY"}
+
+# ============================================================
+# 6) DETERMINISTIC METRICS: HHI (H-score style) + WARW
+# ============================================================
+
+def compute_hhi(
+    df_normalized: pd.DataFrame,
+    portfolio: Optional[str],
+    dimension_type: str,
+    exposure_field: str = "new_ref_values",
+) -> Dict[str, Any]:
+    d = df_normalized.copy()
     if portfolio:
         d = d[d["portfolio"] == portfolio]
-
-    d = d[d["dimension_type"] == dimension_type]
+    d = d[d["dimension_type"] == dimension_type].copy()
     d[exposure_field] = pd.to_numeric(d[exposure_field], errors="coerce").fillna(0)
 
-    g = d.groupby("dimension_value")[exposure_field].sum().reset_index()
-    total = g[exposure_field].sum()
+    g = d.groupby("dimension_value", dropna=False)[exposure_field].sum().reset_index()
+    total = float(g[exposure_field].sum())
 
-    if total == 0:
-        return {"hhi": None}
+    if total <= 0:
+        return {"hhi": None, "total_exposure": total, "top_contributors": g.sort_values(exposure_field, ascending=False).head(10)}
 
     g["share"] = g[exposure_field] / total
     g["share_sq"] = g["share"] ** 2
+    hhi = float(g["share_sq"].sum())
+    top = g.sort_values("share", ascending=False).head(10)
 
-    return {
-        "hhi": g["share_sq"].sum(),
-        "top_contributors": g.sort_values("share", ascending=False).head(10)
-    }
+    return {"hhi": hhi, "total_exposure": total, "top_contributors": top}
 
-# ============================================================
-# 7️⃣ WARW
-# ============================================================
-
-def compute_warw(df, crg_to_warw, portfolio=None, exposure_field="new_ref_values"):
+def compute_warw_from_crg(
+    df_normalized: pd.DataFrame,
+    crg_to_warw: Dict[str, float],
+    portfolio: Optional[str],
+    exposure_field: str = "new_ref_values",
+) -> Dict[str, Any]:
     if not crg_to_warw:
-        return {"error": "Missing CRG to WARW mapping"}
+        return {"error": "MISSING_CRG_WARW_MAPPING"}
 
-    d = df.copy()
+    d = df_normalized.copy()
     if portfolio:
         d = d[d["portfolio"] == portfolio]
-
-    d = d[d["dimension_type"] == "crg"]
+    d = d[d["dimension_type"] == "crg"].copy()
     d[exposure_field] = pd.to_numeric(d[exposure_field], errors="coerce").fillna(0)
 
     d["warw_weight"] = d["dimension_value"].map(crg_to_warw)
+    missing = d[d["warw_weight"].isna()]["dimension_value"].dropna().unique().tolist()
+    if missing:
+        return {"error": "INCOMPLETE_MAPPING", "missing_crg": missing}
 
-    if d["warw_weight"].isna().any():
-        return {"error": "Incomplete CRG mapping"}
+    total = float(d[exposure_field].sum())
+    if total <= 0:
+        return {"warw": None, "total_exposure": total, "top_contributors": None}
 
-    total_exposure = d[exposure_field].sum()
-    if total_exposure == 0:
-        return {"warw": None}
+    warw = float((d[exposure_field] * d["warw_weight"]).sum() / total)
 
-    warw = (d[exposure_field] * d["warw_weight"]).sum() / total_exposure
+    # contributions
+    d["weighted_contrib"] = d[exposure_field] * d["warw_weight"]
+    top = d.groupby("dimension_value", dropna=False).agg(
+        exposure=(exposure_field, "sum"),
+        warw_weight=("warw_weight", "first"),
+        weighted_contrib=("weighted_contrib", "sum"),
+    ).reset_index().sort_values("weighted_contrib", ascending=False).head(10)
 
-    return {
-        "warw": warw,
-        "top_contributors": d.sort_values(exposure_field, ascending=False).head(10)
-    }
+    return {"warw": warw, "total_exposure": total, "top_contributors": top}
 
 # ============================================================
-# 8️⃣ NARRATIVE GENERATION
+# 7) NARRATIVE ANSWER LAYER (LLM explains computed output)
 # ============================================================
 
-def df_to_markdown(df, max_rows=10):
-    if df is None or len(df) == 0:
-        return "_(no rows)_"
-    return df.head(max_rows).to_markdown(index=False)
+ANSWER_WRITER_SYSTEM_PROMPT = """
+You are a risk analytics assistant.
 
-def generate_narrative(user_question, exec_out):
-    table_md = df_to_markdown(exec_out["data"])
+You will receive:
+- The user's question
+- Execution metadata (tabs used, filters, group_by)
+- A result table ALREADY computed
 
-    user_prompt = f"""
-User Question:
-{user_question}
-
-Tabs used:
-{exec_out["meta"].get("tabs_used")}
-
-Result:
-{table_md}
+Rules:
+- Do not invent numbers or columns.
+- Explain concisely in business-friendly language.
+- Mention the tabs used (meta.tabs_used).
+- If result table is empty, say so and suggest how to adjust (e.g., change portfolio or dimension).
+Return plain text only.
 """
 
-    return call_llm(
-        system_prompt=ANSWER_WRITER_SYSTEM_PROMPT,
-        user_prompt=user_prompt
-    )
+def df_to_markdown(df: pd.DataFrame, max_rows: int = 12, max_cols: int = 10) -> str:
+    if df is None or len(df) == 0:
+        return "_(no rows)_"
+    view = df.copy()
+    if view.shape[1] > max_cols:
+        view = view.iloc[:, :max_cols]
+    if len(view) > max_rows:
+        view = view.head(max_rows)
+    return view.to_markdown(index=False)
+
+def generate_narrative_answer(user_question: str, exec_out: Dict[str, Any]) -> str:
+    data_df = exec_out["data"]
+    meta = exec_out.get("meta", {})
+
+    user_prompt = f"""
+User question:
+{user_question}
+
+Meta:
+- tabs_used: {meta.get("tabs_used")}
+- filters: {meta.get("filters")}
+- group_by: {meta.get("group_by")}
+- rows_after_filters: {meta.get("rows_after_filters")}
+- limit: {meta.get("limit")}
+
+Result table:
+{df_to_markdown(data_df)}
+""".strip()
+
+    return call_llm(ANSWER_WRITER_SYSTEM_PROMPT, user_prompt).strip()
 
 # ============================================================
-# 9️⃣ MAIN ENTRY FUNCTION
+# 8) PLANNER: GENERATE -> COERCE -> VALIDATE -> (REPAIR ONCE)
 # ============================================================
 
-def handle_question(user_question, df_normalized, crg_to_warw=None):
+def generate_query_plan_robust(user_question: str) -> Dict[str, Any]:
+    user_prompt = build_planner_user_prompt(user_question)
+    raw = call_llm(QUERY_PLANNER_SYSTEM_PROMPT, user_prompt).strip()
 
-    # Quick unsupported detection
+    try:
+        plan = json.loads(raw)
+    except Exception as e:
+        # try repair once
+        repaired = repair_plan_with_llm(user_question, raw, f"JSON parse error: {e}")
+        plan = repaired
+
+    plan = coerce_plan_defaults(plan)
+
+    try:
+        validate_plan_strict(plan)
+        return plan
+    except Exception as e:
+        # repair once
+        repaired = repair_plan_with_llm(user_question, json.dumps(plan), str(e))
+        repaired = coerce_plan_defaults(repaired)
+        validate_plan_strict(repaired)  # if still fails, raise
+        return repaired
+
+# ============================================================
+# 9) MAIN ENTRYPOINT
+# ============================================================
+
+def extract_portfolio_from_question(user_question: str, known_portfolios: Optional[List[str]] = None) -> Optional[str]:
+    """
+    Optional helper: if you know portfolio names list, detect them in question.
+    If you don't pass known_portfolios, it will only detect common ones if present literally.
+    """
+    if not known_portfolios:
+        return None
+    q = user_question.lower()
+    for p in known_portfolios:
+        if p.lower() in q:
+            return p
+    return None
+
+def handle_question(
+    user_question: str,
+    df_normalized: pd.DataFrame,
+    crg_to_warw: Optional[Dict[str, float]] = None,
+    known_portfolios: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    # 1) Unsupported by text (summary-only limitation)
     reason = detect_unsupported_by_text(user_question)
     if reason:
-        return {"status": "unsupported", "answer": reason}
+        return {
+            "status": "unsupported",
+            "answer": f"I can’t answer that from the current STIP summary tabs. {reason}",
+            "meta": {}
+        }
 
-    # Special direct metric detection
-    if "warw" in user_question.lower():
-        result = compute_warw(df_normalized, crg_to_warw)
-        if "error" in result:
-            return {"status": "unsupported", "answer": result["error"]}
-        return {"status": "ok", "answer": f"WARW = {result['warw']:.4f}"}
+    qlow = user_question.lower()
 
-    if "h score" in user_question.lower() or "concentration" in user_question.lower():
-        result = compute_hhi(df_normalized)
-        return {"status": "ok", "answer": f"H-score (HHI) = {result['hhi']:.6f}"}
+    # 2) Deterministic WARW route
+    if "warw" in qlow:
+        portfolio = extract_portfolio_from_question(user_question, known_portfolios)
+        out = compute_warw_from_crg(df_normalized, crg_to_warw or {}, portfolio=portfolio)
+        if out.get("error"):
+            return {"status": "unsupported", "answer": f"I can’t compute WARW: {out['error']}.", "meta": out}
+        top_md = df_to_markdown(out["top_contributors"]) if out.get("top_contributors") is not None else "_(no rows)_"
+        return {
+            "status": "ok",
+            "answer": f"WARW (current run) = {out['warw']:.4f}. Top CRG contributors:\n{top_md}",
+            "meta": {"portfolio": portfolio, **out}
+        }
 
-    # Standard plan flow
-    plan = generate_query_plan(user_question)
-    validate_plan(plan)
+    # 3) Deterministic H-score (HHI) route
+    if ("h-score" in qlow) or ("h score" in qlow) or ("concentration" in qlow) or ("hhi" in qlow):
+        portfolio = extract_portfolio_from_question(user_question, known_portfolios)
+        # default: country concentration unless user specifies industry/crg
+        dim = "country"
+        if "industry" in qlow:
+            dim = "industry"
+        elif "crg" in qlow or "credit" in qlow or "rating" in qlow:
+            dim = "crg"
 
+        out = compute_hhi(df_normalized, portfolio=portfolio, dimension_type=dim, exposure_field="new_ref_values")
+        if out.get("hhi") is None:
+            return {"status": "ok", "answer": "Cannot compute H-score/HHI because total exposure is zero/empty under the selected filters.", "meta": out}
+        top_md = df_to_markdown(out["top_contributors"])
+        return {
+            "status": "ok",
+            "answer": f"H-score (HHI) by {dim} = {out['hhi']:.6f}. Top contributors:\n{top_md}",
+            "meta": {"portfolio": portfolio, "dimension_type": dim, **out}
+        }
+
+    # 4) Normal planner route (robust)
+    plan = generate_query_plan_robust(user_question)
+
+    # 5) Execute
     exec_out = execute_query_plan(plan, df_normalized)
 
-    answer = generate_narrative(user_question, exec_out)
+    # 6) Narrative answer
+    answer = generate_narrative_answer(user_question, exec_out)
 
     return {
         "status": "ok",
         "answer": answer,
         "plan": plan,
-        "meta": exec_out["meta"]
+        "meta": exec_out.get("meta", {})
     }
