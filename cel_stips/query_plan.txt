@@ -16,6 +16,51 @@ out = execute_query_plan(plan, df_normalized)
 print(out["meta"])
 print(out["data"])
 
+def fix_sort_fields_for_executor(plan: dict) -> dict:
+    """
+    Your executor outputs aggregated metric columns using _agg_series_name(metric),
+    NOT the raw 'field'. This rewrites sort.field to the correct output column name.
+    """
+    metrics = plan.get("metrics", []) or []
+    derived = plan.get("derived", []) or []
+    sort = plan.get("sort", []) or []
+
+    # Build set of output metric column names (exactly how executor names them)
+    metric_output_names = set()
+    field_to_output_name = {}
+
+    for m in metrics:
+        # Match executor logic: name = _agg_series_name(m)
+        name = m.get("name") or f"{m.get('agg','sum')}_{m.get('field','')}"
+        metric_output_names.add(name)
+
+        # Also map raw field -> metric output name (helps when LLM sorts by raw field)
+        field = m.get("field")
+        if field:
+            field_to_output_name[field] = name
+
+    derived_names = {d.get("name") for d in derived if isinstance(d, dict) and d.get("name")}
+
+    new_sort = []
+    for s in sort:
+        if not isinstance(s, dict):
+            continue
+        sf = s.get("field")
+
+        # If already correct (metric name or derived name), keep it
+        if sf in metric_output_names or sf in derived_names:
+            new_sort.append(s)
+            continue
+
+        # If they tried sorting by raw field, rewrite to the metric output name
+        if sf in field_to_output_name:
+            new_sort.append({**s, "field": field_to_output_name[sf]})
+        else:
+            # leave as is (executor will error; but now only for truly wrong fields)
+            new_sort.append(s)
+
+    plan["sort"] = new_sort
+    return plan
 
 ALLOWED_FIELDS = {
     "portfolio", "dimension_type", "dimension_value", "source_tab",
