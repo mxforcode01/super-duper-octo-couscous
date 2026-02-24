@@ -1,0 +1,309 @@
+import json
+import pandas as pd
+import re
+
+# ============================================================
+# 1️⃣ SYSTEM PROMPTS
+# ============================================================
+
+QUERY_PLANNER_SYSTEM_PROMPT = """
+You are a financial analytics query planner.
+
+Your task:
+Convert the user's question into a STRICT JSON query plan.
+
+Rules:
+- Output JSON only. No explanation.
+- Never calculate numbers.
+- Never invent fields.
+- Only use allowed fields and aggregations.
+- If the question cannot be answered using available fields, return:
+  {"error": "UNSUPPORTED_QUERY"}
+
+Allowed fields:
+portfolio
+dimension_type
+dimension_value
+old_ref_values
+reduction
+new_ref_values
+new_replenished_amount
+new_replenished_obligations
+unique_group_ids
+unique_obligor_ids
+whitelisted_existing_amount
+whitelisted_replenished_amount
+whitelisted_total_amount
+h_score_new_ref_value
+h_score_new_replenished_amount
+
+Allowed aggregations:
+sum
+mean
+min
+max
+count
+nunique
+
+Allowed derived operations:
+ratio
+diff
+
+Valid dimension_type values:
+portfolio
+crg
+country
+industry
+
+JSON schema:
+{
+  "filters": [],
+  "group_by": [],
+  "metrics": [],
+  "derived": [],
+  "sort": [],
+  "limit": 10
+}
+"""
+
+ANSWER_WRITER_SYSTEM_PROMPT = """
+You are a risk analytics assistant.
+
+You will be given:
+- The user's question
+- The executed query metadata
+- A result table (already computed)
+
+Rules:
+- Do not invent numbers.
+- Base your answer only on provided data.
+- Mention which sheet tabs were used.
+- Be concise and business friendly.
+- If result empty, say no matching results found.
+
+Return plain text only.
+"""
+
+# ============================================================
+# 2️⃣ UNSUPPORTED QUESTION DETECTION
+# ============================================================
+
+UNSUPPORTED_KEYWORDS = {
+    "past due": "Requires asset-level past due data not available in summary tabs.",
+    "subordinated": "Requires asset-level subordinated flag not available.",
+    "extended maturity": "Requires asset-level maturity fields not available.",
+    "rodd": "Requires maturity comparison data.",
+    "reference id": "Requires asset-level reference IDs.",
+    "downgrade": "Requires historical comparison table.",
+    "previous month": "Requires historical comparison data.",
+}
+
+def detect_unsupported_by_text(user_question: str):
+    q = user_question.lower()
+    for k, reason in UNSUPPORTED_KEYWORDS.items():
+        if k in q:
+            return reason
+    return None
+
+# ============================================================
+# 3️⃣ METRIC SYNONYM ENRICHMENT
+# ============================================================
+
+METRIC_SYNONYMS = {
+    "replenished": "new_replenished_amount",
+    "increase": "new_ref_values",
+    "exposure": "new_ref_values",
+    "reduction": "reduction",
+    "h score": "h_score_new_ref_value",
+    "whitelist": "whitelisted_total_amount"
+}
+
+def enrich_user_prompt(user_question: str):
+    synonym_text = "\nMetric Synonyms:\n"
+    for k, v in METRIC_SYNONYMS.items():
+        synonym_text += f"- '{k}' maps to '{v}'\n"
+
+    return f"""
+User Question:
+{user_question}
+
+{synonym_text}
+"""
+
+# ============================================================
+# 4️⃣ PLAN GENERATION
+# ============================================================
+
+def generate_query_plan(user_question: str):
+    user_prompt = enrich_user_prompt(user_question)
+
+    llm_response = call_llm(
+        system_prompt=QUERY_PLANNER_SYSTEM_PROMPT,
+        user_prompt=user_prompt
+    )
+
+    try:
+        plan = json.loads(llm_response.strip())
+    except json.JSONDecodeError:
+        raise ValueError("LLM did not return valid JSON.")
+
+    return plan
+
+# ============================================================
+# 5️⃣ PLAN VALIDATION
+# ============================================================
+
+ALLOWED_FIELDS = {
+    "portfolio","dimension_type","dimension_value",
+    "old_ref_values","reduction","new_ref_values",
+    "new_replenished_amount","new_replenished_obligations",
+    "unique_group_ids","unique_obligor_ids",
+    "whitelisted_existing_amount","whitelisted_replenished_amount",
+    "whitelisted_total_amount",
+    "h_score_new_ref_value","h_score_new_replenished_amount"
+}
+
+ALLOWED_AGGS = {"sum","mean","min","max","count","nunique"}
+ALLOWED_DERIVED = {"ratio","diff"}
+
+def validate_plan(plan: dict):
+    if "error" in plan:
+        raise ValueError("Unsupported query.")
+
+    for f in plan.get("filters", []):
+        if f["field"] not in ALLOWED_FIELDS:
+            raise ValueError(f"Invalid filter field: {f['field']}")
+
+    for m in plan.get("metrics", []):
+        if m["field"] not in ALLOWED_FIELDS:
+            raise ValueError(f"Invalid metric field: {m['field']}")
+        if m["agg"] not in ALLOWED_AGGS:
+            raise ValueError(f"Invalid aggregation: {m['agg']}")
+
+    for d in plan.get("derived", []):
+        if d["op"] not in ALLOWED_DERIVED:
+            raise ValueError(f"Invalid derived op: {d['op']}")
+
+    return True
+
+# ============================================================
+# 6️⃣ H-SCORE (HHI)
+# ============================================================
+
+def compute_hhi(df, portfolio=None, dimension_type="country", exposure_field="new_ref_values"):
+    d = df.copy()
+    if portfolio:
+        d = d[d["portfolio"] == portfolio]
+
+    d = d[d["dimension_type"] == dimension_type]
+    d[exposure_field] = pd.to_numeric(d[exposure_field], errors="coerce").fillna(0)
+
+    g = d.groupby("dimension_value")[exposure_field].sum().reset_index()
+    total = g[exposure_field].sum()
+
+    if total == 0:
+        return {"hhi": None}
+
+    g["share"] = g[exposure_field] / total
+    g["share_sq"] = g["share"] ** 2
+
+    return {
+        "hhi": g["share_sq"].sum(),
+        "top_contributors": g.sort_values("share", ascending=False).head(10)
+    }
+
+# ============================================================
+# 7️⃣ WARW
+# ============================================================
+
+def compute_warw(df, crg_to_warw, portfolio=None, exposure_field="new_ref_values"):
+    if not crg_to_warw:
+        return {"error": "Missing CRG to WARW mapping"}
+
+    d = df.copy()
+    if portfolio:
+        d = d[d["portfolio"] == portfolio]
+
+    d = d[d["dimension_type"] == "crg"]
+    d[exposure_field] = pd.to_numeric(d[exposure_field], errors="coerce").fillna(0)
+
+    d["warw_weight"] = d["dimension_value"].map(crg_to_warw)
+
+    if d["warw_weight"].isna().any():
+        return {"error": "Incomplete CRG mapping"}
+
+    total_exposure = d[exposure_field].sum()
+    if total_exposure == 0:
+        return {"warw": None}
+
+    warw = (d[exposure_field] * d["warw_weight"]).sum() / total_exposure
+
+    return {
+        "warw": warw,
+        "top_contributors": d.sort_values(exposure_field, ascending=False).head(10)
+    }
+
+# ============================================================
+# 8️⃣ NARRATIVE GENERATION
+# ============================================================
+
+def df_to_markdown(df, max_rows=10):
+    if df is None or len(df) == 0:
+        return "_(no rows)_"
+    return df.head(max_rows).to_markdown(index=False)
+
+def generate_narrative(user_question, exec_out):
+    table_md = df_to_markdown(exec_out["data"])
+
+    user_prompt = f"""
+User Question:
+{user_question}
+
+Tabs used:
+{exec_out["meta"].get("tabs_used")}
+
+Result:
+{table_md}
+"""
+
+    return call_llm(
+        system_prompt=ANSWER_WRITER_SYSTEM_PROMPT,
+        user_prompt=user_prompt
+    )
+
+# ============================================================
+# 9️⃣ MAIN ENTRY FUNCTION
+# ============================================================
+
+def handle_question(user_question, df_normalized, crg_to_warw=None):
+
+    # Quick unsupported detection
+    reason = detect_unsupported_by_text(user_question)
+    if reason:
+        return {"status": "unsupported", "answer": reason}
+
+    # Special direct metric detection
+    if "warw" in user_question.lower():
+        result = compute_warw(df_normalized, crg_to_warw)
+        if "error" in result:
+            return {"status": "unsupported", "answer": result["error"]}
+        return {"status": "ok", "answer": f"WARW = {result['warw']:.4f}"}
+
+    if "h score" in user_question.lower() or "concentration" in user_question.lower():
+        result = compute_hhi(df_normalized)
+        return {"status": "ok", "answer": f"H-score (HHI) = {result['hhi']:.6f}"}
+
+    # Standard plan flow
+    plan = generate_query_plan(user_question)
+    validate_plan(plan)
+
+    exec_out = execute_query_plan(plan, df_normalized)
+
+    answer = generate_narrative(user_question, exec_out)
+
+    return {
+        "status": "ok",
+        "answer": answer,
+        "plan": plan,
+        "meta": exec_out["meta"]
+    }
