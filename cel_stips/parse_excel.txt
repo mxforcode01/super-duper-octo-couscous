@@ -1,37 +1,54 @@
 import pandas as pd
 
-def parse_stip_excel(file_path):
-    # Read entire workbook
-    xls = pd.ExcelFile(file_path)
+def clean_column_name(col):
+    return (
+        col.strip()
+           .lower()
+           .replace(" ", "_")
+           .replace("%", "pct")
+    )
 
+def extract_portfolio_from_sheet(sheet_name):
+    if "-" in sheet_name:
+        return sheet_name.split("-")[0]
+    return sheet_name
+
+def detect_dimension_type(sheet_name):
+    name = sheet_name.lower()
+    if "crg" in name:
+        return "crg"
+    elif "country" in name:
+        return "country"
+    elif "industry" in name:
+        return "industry"
+    elif name == "portfolio":
+        return "portfolio"
+    return None
+
+
+def parse_stip_excel(file_path):
+    xls = pd.ExcelFile(file_path)
     normalized_rows = []
 
     for sheet in xls.sheet_names:
-        df = pd.read_excel(xls, sheet_name=sheet)
-
-        # Detect dimension type from sheet name
-        if "crg" in sheet.lower():
-            dimension_type = "crg"
-        elif "country" in sheet.lower():
-            dimension_type = "country"
-        elif "industry" in sheet.lower():
-            dimension_type = "industry"
-        elif sheet.lower() == "portfolio":
-            dimension_type = "portfolio"
-        else:
+        dimension_type = detect_dimension_type(sheet)
+        if dimension_type is None:
             continue
 
-        # Try to standardize column names
-        df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+        df = pd.read_excel(xls, sheet_name=sheet)
 
-        # Identify dimension column
-        dimension_column = df.columns[0]
+        # Standardize column names
+        df.columns = [clean_column_name(c) for c in df.columns]
+
+        dimension_column = df.columns[0]  # first column is dimension value
 
         for _, row in df.iterrows():
             normalized_rows.append({
                 "portfolio": extract_portfolio_from_sheet(sheet),
                 "dimension_type": dimension_type,
                 "dimension_value": row[dimension_column],
+
+                # Core metrics (common across tabs)
                 "old_ref_values": row.get("old_reference_values"),
                 "reduction": row.get("reduction"),
                 "new_ref_values": row.get("new_reference_values"),
@@ -39,13 +56,30 @@ def parse_stip_excel(file_path):
                 "new_replenished_obligations": row.get("new_replenished_obligations"),
                 "unique_group_ids": row.get("unique_group_ids"),
                 "unique_obligor_ids": row.get("unique_obligor_ids"),
+                "whitelisted_existing_amount": row.get("whitelisted_existing_amount"),
+                "whitelisted_replenished_amount": row.get("whitelisted_replenished_amount"),
+                "whitelisted_total_amount": row.get("whitelisted_total_amount"),
+
+                # Portfolio-only columns (safe for other tabs)
+                "h_score_new_ref_value": row.get("h_score_new_ref_value"),
+                "h_score_new_replenished_amount": row.get("h_score_new_replenished_amount"),
+
                 "source_tab": sheet
             })
 
-    return pd.DataFrame(normalized_rows)
+    df_final = pd.DataFrame(normalized_rows)
 
+    # Ensure numeric columns are numeric
+    numeric_cols = [
+        "old_ref_values", "reduction", "new_ref_values",
+        "new_replenished_amount", "new_replenished_obligations",
+        "unique_group_ids", "unique_obligor_ids",
+        "whitelisted_existing_amount", "whitelisted_replenished_amount",
+        "whitelisted_total_amount",
+        "h_score_new_ref_value", "h_score_new_replenished_amount"
+    ]
 
-def extract_portfolio_from_sheet(sheet_name):
-    if "-" in sheet_name:
-        return sheet_name.split("-")[0]
-    return sheet_name
+    for col in numeric_cols:
+        df_final[col] = pd.to_numeric(df_final[col], errors="coerce")
+
+    return df_final
