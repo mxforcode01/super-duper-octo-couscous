@@ -1,0 +1,149 @@
+import pandas as pd
+
+ALLOWED_FIELDS = {
+    "portfolio", "dimension_type", "dimension_value", "source_tab",
+    "old_ref_values", "reduction", "new_ref_values",
+    "new_replenished_amount", "new_replenished_obligations",
+    "unique_group_ids", "unique_obligor_ids",
+    "whitelisted_existing_amount", "whitelisted_replenished_amount", "whitelisted_total_amount",
+    "h_score_new_ref_value", "h_score_new_replenished_amount",
+}
+
+ALLOWED_OPS = {"=", "!=", "in", "not_in", ">", ">=", "<", "<="}
+ALLOWED_AGGS = {"sum", "mean", "min", "max", "count", "nunique"}
+
+
+def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
+    out = df
+    for f in filters or []:
+        field = f.get("field")
+        op = f.get("op")
+        value = f.get("value")
+
+        if field not in ALLOWED_FIELDS:
+            raise ValueError(f"Disallowed filter field: {field}")
+        if op not in ALLOWED_OPS:
+            raise ValueError(f"Disallowed filter op: {op}")
+
+        s = out[field]
+
+        if op == "=":
+            out = out[s == value]
+        elif op == "!=":
+            out = out[s != value]
+        elif op == "in":
+            if not isinstance(value, list):
+                raise ValueError("Filter 'in' requires list value")
+            out = out[s.isin(value)]
+        elif op == "not_in":
+            if not isinstance(value, list):
+                raise ValueError("Filter 'not_in' requires list value")
+            out = out[~s.isin(value)]
+        elif op == ">":
+            out = out[pd.to_numeric(s, errors="coerce") > value]
+        elif op == ">=":
+            out = out[pd.to_numeric(s, errors="coerce") >= value]
+        elif op == "<":
+            out = out[pd.to_numeric(s, errors="coerce") < value]
+        elif op == "<=":
+            out = out[pd.to_numeric(s, errors="coerce") <= value]
+
+    return out
+
+
+def _agg_series_name(metric: dict) -> str:
+    return metric.get("name") or f"{metric['agg']}_{metric['field']}"
+
+
+def execute_query_plan(plan: dict, df: pd.DataFrame) -> dict:
+    """
+    Executes a strict query plan on the normalized STIP dataframe.
+    Returns dict with:
+      - data: result dataframe
+      - meta: lineage info (tabs used, row counts, applied filters)
+    """
+    filters = plan.get("filters", [])
+    group_by = plan.get("group_by", [])
+    metrics = plan.get("metrics", [])
+    derived = plan.get("derived", [])
+    sort = plan.get("sort", [])
+    limit = plan.get("limit", 50)
+
+    # Validate group_by fields
+    for g in group_by:
+        if g not in ALLOWED_FIELDS:
+            raise ValueError(f"Disallowed group_by field: {g}")
+
+    # Validate metrics
+    for m in metrics:
+        field = m.get("field")
+        agg = m.get("agg")
+        if field not in ALLOWED_FIELDS:
+            raise ValueError(f"Disallowed metric field: {field}")
+        if agg not in ALLOWED_AGGS:
+            raise ValueError(f"Disallowed agg: {agg}")
+
+    df0 = df.copy()
+    df1 = _apply_filters(df0, filters)
+
+    # Track lineage (tabs used)
+    tabs_used = sorted(df1["source_tab"].dropna().unique().tolist()) if "source_tab" in df1.columns else []
+
+    # Aggregate
+    if metrics:
+        agg_map = {}
+        rename_map = {}
+        for m in metrics:
+            field = m["field"]
+            agg = m["agg"]
+            name = _agg_series_name(m)
+            agg_map[name] = (field, agg)  # pandas named aggregation
+        if group_by:
+            res = df1.groupby(group_by, dropna=False).agg(**agg_map).reset_index()
+        else:
+            res = df1.agg(**{k: pd.NamedAgg(column=v[0], aggfunc=v[1]) for k, v in agg_map.items()}).to_frame().T
+    else:
+        # If no metrics, just return filtered rows (capped)
+        res = df1.copy()
+
+    # Derived fields (simple, auditable ops)
+    # Supported derived ops: ratio, diff
+    # ratio: num/den ; diff: a-b
+    for d in derived:
+        name = d["name"]
+        op = d["op"]
+        if op == "ratio":
+            num = d["num"]
+            den = d["den"]
+            res[name] = res[num] / res[den].replace({0: pd.NA})
+        elif op == "diff":
+            a = d["a"]
+            b = d["b"]
+            res[name] = res[a] - res[b]
+        else:
+            raise ValueError(f"Unsupported derived op: {op}")
+
+    # Sort
+    for s in sort or []:
+        field = s.get("field")
+        direction = s.get("direction", "desc")
+        if field not in res.columns:
+            raise ValueError(f"Cannot sort by missing field: {field}")
+        res = res.sort_values(field, ascending=(direction == "asc"), na_position="last")
+
+    # Limit
+    limit = int(limit) if limit is not None else 50
+    limit = max(1, min(limit, 500))
+    res = res.head(limit)
+
+    return {
+        "data": res,
+        "meta": {
+            "rows_before": int(len(df0)),
+            "rows_after_filters": int(len(df1)),
+            "tabs_used": tabs_used,
+            "filters": filters,
+            "group_by": group_by,
+            "limit": limit
+        }
+    }
