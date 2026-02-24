@@ -1,0 +1,51 @@
+import pandas as pd
+
+def parse_stip_excel(file_path):
+    # Read entire workbook
+    xls = pd.ExcelFile(file_path)
+
+    normalized_rows = []
+
+    for sheet in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=sheet)
+
+        # Detect dimension type from sheet name
+        if "crg" in sheet.lower():
+            dimension_type = "crg"
+        elif "country" in sheet.lower():
+            dimension_type = "country"
+        elif "industry" in sheet.lower():
+            dimension_type = "industry"
+        elif sheet.lower() == "portfolio":
+            dimension_type = "portfolio"
+        else:
+            continue
+
+        # Try to standardize column names
+        df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+        # Identify dimension column
+        dimension_column = df.columns[0]
+
+        for _, row in df.iterrows():
+            normalized_rows.append({
+                "portfolio": extract_portfolio_from_sheet(sheet),
+                "dimension_type": dimension_type,
+                "dimension_value": row[dimension_column],
+                "old_ref_values": row.get("old_reference_values"),
+                "reduction": row.get("reduction"),
+                "new_ref_values": row.get("new_reference_values"),
+                "new_replenished_amount": row.get("new_replenished_amount"),
+                "new_replenished_obligations": row.get("new_replenished_obligations"),
+                "unique_group_ids": row.get("unique_group_ids"),
+                "unique_obligor_ids": row.get("unique_obligor_ids"),
+                "source_tab": sheet
+            })
+
+    return pd.DataFrame(normalized_rows)
+
+
+def extract_portfolio_from_sheet(sheet_name):
+    if "-" in sheet_name:
+        return sheet_name.split("-")[0]
+    return sheet_name
